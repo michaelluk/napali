@@ -7,5 +7,6 @@ put('//@@COAST@@', 'v2_coast.txt');
 put('//@@BUILD@@', 'v2_build.txt');
 put('//@@COASTSDF@@', 'v2_coastsdf.txt');
 put('//@@FLIGHT@@', 'v2_flight.js');
+put('//@@RACE@@', 'race.js');
 fs.writeFileSync(dir + '/../index.html', t);
 console.log('built index.html', t.length, 'bytes');

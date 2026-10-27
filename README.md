@@ -21,11 +21,42 @@ take 30-90 s; after that it starts quickly.
 |---|---|
 | `index.html` | the drone flight in real time |
 | `index.html?mode=still` | the final aerial composition as a high-quality still (`&spp=16` by default) |
+| `index.html?mode=race` | 納帕利海岸賽艇: a powerboat race along the coast (see below) |
 
 In the flight view: `Space` pause, `R` restart, `←` / `→` skip 5 s, `F` fullscreen, `H` toggle the HUD.
 
 The page needs a decent GPU. It was developed on a laptop with an integrated GPU, where a 1672x941 frame takes about
 1-2 s offline, so the real-time view drops resolution automatically.
+
+## Powerboat race
+
+![The race under the cliffs](media/race.jpg)
+
+`index.html?mode=race` turns the scene into a game: four offshore powerboats race laps of a buoyed course under the
+cliffs, round the sea stacks and back offshore. You start at the back of the grid against three AI crews (Kalalau,
+Hanakāpīʻai, Nuʻalolo). Pass between the orange pylons of every gate; the next one glows and has light beams over it.
+
+| Key | Action |
+|---|---|
+| `W` / `↑` | throttle |
+| `S` / `↓` | brake, reverse |
+| `A` `D` / `←` `→` | steer |
+| `Shift` / `Space` | boost (the bar under the speedometer, recharges) |
+| `C` | camera: chase, far chase, bow |
+| `R` | back to the last gate (after a missed gate or a crash) |
+| `P` / `Esc` | pause |
+| `M` | mute |
+| `Enter` | start, race again |
+
+A gamepad works too (left stick, triggers, A to boost, Start). URL options: `laps=3` (default 2), `ai=1.0` (rival
+pace, default 0.96), `mute=1`.
+
+The boats, pylons, wakes and spray are rasterised into the ray march's HDR buffer before the post chain, and depth-tested
+against the ray march's hit distance (a second render target), so waves, sea stacks and headlands hide them correctly.
+The hulls ride the real FFT ocean: every frame a small probe pass runs the water shader's own `oceanH()` under each hull
+and pylon, read back asynchronously. The coast collision uses the generator's coastline distance field. Engine, water
+and countdown sounds are synthesised with Web Audio. It needs the same GPU as the flight view; the render resolution
+adapts to keep the frame rate up.
 
 ## Render a video
 
@@ -76,6 +107,7 @@ node tools/rebuild.cjs
 | `tweaks.cjs` | string patches on the template: vegetation mask, beach profile, haze, the colour grade |
 | `patch_v3.cjs`, `patch_v4.cjs` | splice the GLSL parts and the plant placement pass into the template |
 | `v2_flight.js` | camera paths (cinematic flight and FPV keys) |
+| `race.js`, `patch_race.cjs` | the powerboat race (`mode=race`) and its hooks in the template |
 | `v2_coast.txt`, `v2_coastsdf.txt`, `v2_build.txt` | coastline polygon and terrain build data |
 
 Most look parameters are exposed as URL knobs (see `num('...')` calls in the page), so they can be tuned without a rebuild.
