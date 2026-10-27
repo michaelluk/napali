@@ -56,9 +56,29 @@ void main(){
     if (Q2('racelite') === '1') return LITE;
     const a ='\nout vec4 o;\n', i = FS_RENDER.indexOf(a), j = FS_RENDER.lastIndexOf('o=vec4(col,uAOut');
     if (i < 0 || j < 0) throw new Error('race: render shader hooks not found');
-    return FS_RENDER.slice(0, i) + '\nlayout(location=0) out vec4 o; layout(location=1) out vec4 oDep;\n' + FS_RENDER.slice(i + a.length, j) +
-      'oDep=vec4(tt>0.?tt:1e6,0.,0.,1.);\n  ' + FS_RENDER.slice(j);
+    const m = 'if(tmin<far) hitT=march(ro,rd,tmin,far,tT,inf);';
+    if (!FS_RENDER.includes(m)) throw new Error('race: march call not found');
+    // a ray that has sunk below y = -4 is under every possible water surface (waterHit's bound), so the water was hit
+    // first: stop the terrain march there instead of stepping along the seabed (same picture, far fewer steps at sea level)
+    return (FS_RENDER.slice(0, i) + '\nlayout(location=0) out vec4 o; layout(location=1) out vec4 oDep;\n' + FS_RENDER.slice(i + a.length, j) +
+      'oDep=vec4(tt>0.?tt:1e6,0.,0.,1.);\n  ' + FS_RENDER.slice(j))
+      .replace(m, 'float farT=rd.y<0.?min(far,(ro.y+4.)/-rd.y):far; if(tmin<farT) hitT=march(ro,rd,tmin,farT,tT,inf);')
+      // real time: the sky (volumetric cumulus, ~40 % of a sea-level frame) comes from a panorama cache (see skyCacheUpdate)
+      .replace(need('else { col=skyView(rd); tt=-1.; }'), 'else { col=uRSkyOn>0.?rSkyCache(rd):skyView(rd); tt=-1.; }')
+      .replace(need('void main(){\n  vec2 fc=gl_FragCoord.xy+uJit;'), SKY_LOOKUP + 'void main(){\n  vec2 fc=gl_FragCoord.xy+uJit;');
   }
+  function need(s) { if (!FS_RENDER.includes(s)) throw new Error('race: render shader hook not found: ' + s.slice(0, 40)); return s; }
+  const SKY_W = 2048, SKY_H = 512, SKY_SLICES = 128;
+  const SKY_MAP = `
+const float RSKY_EL0=-.05;   // panorama rows: elevation -.05 .. pi/2, squared spacing (finer near the horizon)
+vec3 rSkyDir(vec2 uv){ float az=(uv.x-.5)*6.2831853, el=RSKY_EL0+(1.5707963-RSKY_EL0)*uv.y*uv.y; return vec3(cos(el)*sin(az),sin(el),cos(el)*cos(az)); }
+`;
+  const SKY_LOOKUP = SKY_MAP + `uniform sampler2D uRSky; uniform float uRSkyOn;
+vec3 rSkyCache(vec3 rd){
+  float el=asin(clamp(rd.y,-1.,1.)), v=sqrt(clamp((el-RSKY_EL0)/(1.5707963-RSKY_EL0),0.,1.));
+  return textureLod(uRSky,vec2(atan(rd.x,rd.z)/6.2831853+.5,v),0.).rgb;
+}
+`;
 
   // ---------------------------------------------------------------- course
   function buildTrack(keys) {
@@ -761,6 +781,30 @@ void main(){ o=texelFetch(uRSrc,ivec2(gl_FragCoord.xy),0); }`;
     return ch;
   }
 
+  // ---------------------------------------------------------------- sky cache
+  // The scene's own skyView() rendered into a 2048 x 512 HDR panorama; real-time frames look the sky up there instead
+  // of ray marching the cumulus for every sky pixel. One of 128 vertical strips is refreshed per frame (the clouds drift
+  // a few m/s at 1+ km: a strip-per-frame refresh is invisible). Photo mode and shoot() use the exact skyView().
+  function skyInit() {
+    if (Q2('racelite') === '1') return;
+    const pre = G.src.slice(0, G.src.lastIndexOf('void main(){'));
+    try { G.pSky = prog(pre + `void main(){ o=vec4(skyView(rSkyDir(gl_FragCoord.xy/vec2(${SKY_W}.,${SKY_H}.))),1.); }\n`); }
+    catch (e) { console.warn('race: sky cache unavailable:', e.message); return; }
+    G.skyTex = tex(SKY_W, SKY_H, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT, gl.LINEAR, null, gl.REPEAT);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    G.skyFb = fbo(G.skyTex); G.skyN = 0;
+  }
+  const skyReady = () => G.pSky && G.skyN >= SKY_SLICES;
+  function skyCacheUpdate(cam, time, slices) {
+    if (!G.pSky) return;
+    const w = SKY_W / SKY_SLICES;
+    renderSample(cam, time, [0, 0], true, G.pSky, () => {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, G.skyFb); gl.viewport(0, 0, SKY_W, SKY_H); gl.enable(gl.SCISSOR_TEST);
+      for (let k = 0; k < slices; k++, G.skyN++) { gl.scissor((G.skyN % SKY_SLICES) * w, 0, w, SKY_H); gl.drawArrays(gl.TRIANGLES, 0, 3); }
+      gl.disable(gl.SCISSOR_TEST);
+    });
+  }
+
   // ---------------------------------------------------------------- drawing
   function initGL() {
     const pre = G.src.slice(0, G.src.lastIndexOf('void main(){'));
@@ -865,7 +909,13 @@ void main(){ o=texelFetch(uRSrc,ivec2(gl_FragCoord.xy),0); }`;
     gl.bindVertexArray(vao);
   }
   // one full sample of the frame (scene + objects) into R.acc
-  function renderOne(cam, time, jit) { clearAcc(); renderSample(cam, time, jit, true); drawObjects(cam, time, jit); }
+  function renderOne(cam, time, jit, live = false) {
+    const sky = live && skyReady();
+    gl.useProgram(pr.p); gl.uniform1f(pr.u.uRSkyOn, sky ? 1 : 0);
+    if (sky) { bindTex(14, G.skyTex); gl.uniform1i(pr.u.uRSky, 14); }
+    R.bandpx = live ? 1e9 : 0;   // live frames in one go; slow full-resolution samples keep the driver-friendly bands
+    clearAcc(); renderSample(cam, time, jit, true); drawObjects(cam, time, jit);
+  }
   function accClear() { ensureTarget(); gl.bindFramebuffer(gl.FRAMEBUFFER, G.Af); gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT); G.An = 0; }
   function accAdd() {
     gl.bindFramebuffer(gl.FRAMEBUFFER, G.Af); gl.viewport(0, 0, R.w, R.h); gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
@@ -1051,7 +1101,7 @@ void main(){ o=texelFetch(uRSrc,ivec2(gl_FragCoord.xy),0); }`;
     resetRace();
     G.cam = { pos: [0, 10, 0] }; G.camW = { h: [0] }; G.cyaw = BOATS[0].yaw; G.fov = 58; G.lat = 0.05;
     G.autopilot = Q2('autopilot') === '1';
-    initGL(); probeInit(G.src);
+    initGL(); probeInit(G.src); skyInit();
     buildUI(); titlePanel();
     addEventListener('keydown', (e) => {
       if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].includes(e.code)) e.preventDefault();
@@ -1065,12 +1115,24 @@ void main(){ o=texelFetch(uRSrc,ivec2(gl_FragCoord.xy),0); }`;
     if (Q2('autostart') === '1') onKey('Enter');
     // test / render hooks: fast-forward without rendering, let the hulls settle on the probed waves, offline frames
     window.__race = {
-      S: () => S, boats: () => BOATS, cam: (m) => { S.camMode = m; }, coast: coastAt, gates: () => GATES, track: () => T, key: onKey, shoot,
+      S: () => S, boats: () => BOATS, cam: (m) => { S.camMode = m; },
+      // time the passes of a live frame at a render scale (each followed by a 1-pixel read so the GPU work is done)
+      prof: (n = 3, rsc = 0.5) => {
+        resize(Math.round(cv.width * rsc), Math.round(cv.height * rsc)); const T = {}, px = new Float32Array(4), tick = (k, t0) => { gl.bindFramebuffer(gl.FRAMEBUFFER, R.f); gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.FLOAT, px); T[k] = (T[k] || 0) + performance.now() - t0; };
+        while (!skyReady() && G.pSky) skyCacheUpdate(frameCam(0), oceanT(), 8);
+        for (let i = 0; i < n; i++) {
+          const cam = frameCam(1 / 60), t = oceanT(); let t0 = performance.now();
+          oceanUpdate(t); probeIssue(cam, t, probePoints()); skyCacheUpdate(cam, t, 1); tick('ocean+probe+sky', t0); t0 = performance.now();
+          renderOne(cam, t, [0, 0], true); tick('frame', t0); t0 = performance.now();
+          present(false); tick('post', t0);
+        }
+        for (const k in T) T[k] = +(T[k] / n).toFixed(1); T.res = R.w + 'x' + R.h; return T;
+      }, coast: coastAt, gates: () => GATES, track: () => T, key: onKey, shoot,
       sim: (sec, dt = 1 / 60) => { for (let t = 0; t < sec; t += dt) { advance(dt, readInput()); frameCam(dt); } },
       settle: (sec, dt = 1 / 60) => { for (let t = 0; t < sec; t += dt) { const cam = frameCam(dt); oceanUpdate(oceanT()); probeSync(cam, oceanT(), probePoints()); advance(dt, readInput()); } },
     };
     if (Q.has('nodraw')) { window.__ready = true; return; }
-    let last = performance.now(), rs = num('rs', 0.5), slow = 0, fast = 0;
+    let last = performance.now(), rs = num('rs', 0.5), ft = 1 / 30, adaptT = 0;
     const loop = (now) => {
       requestAnimationFrame(loop);
       const dt = Math.min((now - last) / 1000, 0.1); last = now;
@@ -1087,13 +1149,20 @@ void main(){ o=texelFetch(uRSrc,ivec2(gl_FragCoord.xy),0); }`;
         LOOK.grain = 0.003; presentAcc();
       } else {
         G.still = false;
-        if (dt > 0.05) { slow++; fast = 0; } else if (dt < 0.03) { fast++; slow = 0; }
-        if (slow > 6) { rs = Math.max(0.25, rs - 0.05); slow = 0; } if (fast > 40) { rs = Math.min(1, rs + 0.05); fast = 0; }
-        resize(Math.round(cv.width * rs), Math.round(cv.height * rs));
+        // resolution follows the measured frame time toward ~36 fps (steps of 5 %, so the buffers are not rebuilt every frame)
+        ft = ft * 0.85 + dt * 0.15; adaptT += dt;
+        if (adaptT > 0.4) {
+          adaptT = 0;
+          if (ft > 1 / 30) rs = Math.max(0.2, rs * clamp(Math.sqrt(1 / 36 / ft), 0.7, 0.95));
+          else if (ft < 1 / 50) rs = Math.min(1, rs * 1.07);
+        }
+        const rq = Math.round(rs * 20) / 20;
+        resize(Math.round(cv.width * rq), Math.round(cv.height * rq));
         const t = oceanT(); oceanUpdate(t);
+        skyCacheUpdate(cam, t, skyReady() ? 1 : 8);
         probeIssue(cam, t, probePoints());
         G.lat = 0.7 * G.lat + 0.3 * Math.min(0.25, dt * 1.5);
-        renderOne(cam, t, [0, 0]);
+        renderOne(cam, t, [0, 0], true);
         LOOK.lens = 0; LOOK.ca = 0; LOOK.grain = 0.004;
         present(false);
       }

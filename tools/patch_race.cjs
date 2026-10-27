@@ -8,6 +8,7 @@ module.exports = (rep) => {
   rep('function renderSample(cam, time, jit, oceanReady) {', 'function renderSample(cam, time, jit, oceanReady, P0 = null, drawFn = null) {');
   rep('gl.useProgram(pr.p);\n  const u = pr.u;', 'const PR = P0 || pr; gl.useProgram(PR.p);\n  const u = PR.u;');
   rep('  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);\n  const bands', '  if (drawFn) { drawFn(PR); return; }\n  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);\n  const bands');
+  rep('Math.ceil(R.w * R.h / (num("bandpx", 15000)))', 'Math.ceil(R.w * R.h / (R.bandpx || num("bandpx", 15000)))');
   rep('//@@FLIGHT@@', '//@@FLIGHT@@\n//@@RACE@@');
   rep('pr = prog(FS_RENDER);', "pr = prog(MODE === 'race' ? RaceMode.renderSrc() : FS_RENDER);");
   rep('await readGround();\n    startDrone();', "await readGround();\n    if (MODE === 'race') RaceMode.start(); else startDrone();");
