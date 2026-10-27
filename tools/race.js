@@ -918,13 +918,13 @@ void main(){ o=texelFetch(uRSrc,ivec2(gl_FragCoord.xy),0); }`;
   function flash(s, dur = 1.6) { S.msg = s; S.msgT = dur; }
   function showPanel(html, low = false) { ui.panel.innerHTML = html; ui.panel.style.display = html ? 'block' : 'none'; ui.panel.classList.toggle('low', low); }
   function titlePanel() {
-    showPanel(`<h1>納帕利海岸賽艇</h1><h2>NA PALI POWERBOAT GRAND PRIX · ${RACE.laps} 圈 laps · 4 艇 boats</h2>${KEYS_HTML}<div class="go">撳 Enter 開始 · press Enter</div>`, true);
+    showPanel(`<h1>納帕利海岸賽艇</h1><h2>NA PALI POWERBOAT GRAND PRIX · ${RACE.laps} 圈 laps · 4 艇 boats</h2>${KEYS_HTML}<div class="go">撳 Enter 或者 click 開始 · press Enter or click</div>`, true);
   }
   function showResults() {
     const rows = standings().map((b, i) => `<tr class="${b.ai ? '' : 'me'}"><td>${i + 1}</td><td><span style="color:${b.crew.css}">●</span> ${b.crew.name}</td><td class="n">${b.finish != null ? fmtT(b.finish) : '—'}</td><td class="n">${b.laps.length ? fmtT(Math.min(...b.laps)) : ''}</td></tr>`).join('');
     const me = standings().indexOf(BOATS[0]) + 1;
     showPanel(`<h1>${me === 1 ? '冠軍! 🏆' : `第 ${me} 名`}</h1><h2>${me === 1 ? 'YOU WIN' : `YOU FINISHED ${ORD[me]}`} · ${fmtT(BOATS[0].finish)}</h2>
-<table><tr><td></td><td></td><td class="n">總時間 time</td><td class="n">最快圈 best lap</td></tr>${rows}</table><div class="go">撳 Enter 再嚟一次 · press Enter to race again</div>`);
+<table><tr><td></td><td></td><td class="n">總時間 time</td><td class="n">最快圈 best lap</td></tr>${rows}</table><div class="go">撳 Enter 或者 click 再嚟一次 · Enter or click to race again</div>`);
     if (S.resT == null) S.resT = S.t;
   }
   function buildMap() {
@@ -1059,6 +1059,7 @@ void main(){ o=texelFetch(uRSrc,ivec2(gl_FragCoord.xy),0); }`;
       keys.add(e.code);
     });
     addEventListener('keyup', (e) => keys.delete(e.code));
+    addEventListener('pointerdown', () => { window.focus(); if (S.phase === 'title' || S.phase === 'done') onKey('Enter'); });   // a click starts too (and gives an embedded page the keyboard)
     addEventListener('blur', () => keys.clear());
     addEventListener('resize', () => { cv.width = innerWidth; cv.height = innerHeight; });
     if (Q2('autostart') === '1') onKey('Enter');
@@ -1106,7 +1107,7 @@ void main(){ o=texelFetch(uRSrc,ivec2(gl_FragCoord.xy),0); }`;
   if (MODE === 'race') {
     document.title = 'Na Pali Powerboat Race';
     const l = document.getElementById('load');
-    if (l) l.insertAdjacentHTML('afterbegin', `<div class="race-title">納帕利海岸賽艇</div><div class="race-sub">NA PALI POWERBOAT GRAND PRIX</div>`);
+    if (l) l.insertAdjacentHTML('afterbegin', `<div class="race-title">納帕利海岸賽艇</div><div class="race-sub">NA PALI POWERBOAT GRAND PRIX</div><div class="race-sub">生成地形約需 30–90 秒 · building the coast takes 30–90 s on a desktop GPU</div>`);
     const st = document.createElement('style'); st.textContent = CSS.replace(/(\d*\.?\d+)px/g, (m, n) => +(n / 16).toFixed(4) + 'rem'); document.head.appendChild(st);
     const fit = () => { document.documentElement.style.fontSize = clamp(Math.min(innerHeight / 1080, innerWidth / 1700) * 16, 7, 26).toFixed(2) + 'px'; };
     fit(); addEventListener('resize', fit);
