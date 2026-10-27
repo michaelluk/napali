@@ -2,9 +2,10 @@
 //  Powerboat race (index.html?mode=race)
 // ============================================================================
 // Four offshore powerboats race laps of a buoyed course along the cliffs. The scene is the same ray-marched world; the
-// boats, pylons, wakes and spray are rasterised into its HDR buffer afterwards and depth-tested against the ray march's
-// hit distance (a second render target), so waves, sea stacks and headlands hide them correctly. The hulls ride the real
-// FFT ocean: a probe pass runs the water shader's own oceanH() under every hull and pylon each frame (read back async).
+// boats, pylons, wakes and spray are rasterised into its HDR buffer before the post chain, depth-tested against the ray
+// march's hit distance (a second render target) so waves, sea stacks and headlands hide them, and shaded with the scene
+// shader's own sun, sky, reflections, terrain shadows and haze; a sun shadow map adds their shadows on deck and water.
+// The hulls ride the real FFT ocean: a probe pass runs the water shader's oceanH() under every hull and pylon.
 const RaceMode = (() => {
   const Q2 = (k) => Q.get(k);
   const RACE = {
@@ -17,10 +18,10 @@ const RaceMode = (() => {
   };
   const BOAT = { acc: 13, drag: 0.004, lin: 0.08, grip: 2.2, turn: 1.2 };
   const CREW = [
-    { name: '你 YOU', hull: [.62, .03, .025], trim: [.82, .82, .8], css: '#ff4a36' },
-    { name: 'Kalalau', hull: [.02, .07, .38], trim: [.9, .55, .02], css: '#4d82ff' },
-    { name: 'Hanakāpīʻai', hull: [.85, .5, .02], trim: [.03, .03, .03], css: '#ffc21f' },
-    { name: 'Nuʻalolo', hull: [.8, .8, .78], trim: [.02, .35, .12], css: '#35d07f' },
+    { name: '你 YOU', hull: [.55, .025, .02], trim: [.82, .82, .8], css: '#ff4a36', num: 7 },
+    { name: 'Kalalau', hull: [.015, .05, .3], trim: [.85, .5, .02], css: '#4d82ff', num: 22 },
+    { name: 'Hanakāpīʻai', hull: [.8, .45, .015], trim: [.025, .025, .025], css: '#ffc21f', num: 41 },
+    { name: 'Nuʻalolo', hull: [.78, .78, .76], trim: [.015, .3, .1], css: '#35d07f', num: 88 },
   ];
   const AI_SKILL = [1, 0.985, 0.965, 0.95];
   const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
@@ -35,6 +36,13 @@ const RaceMode = (() => {
 precision highp float; precision highp sampler2D;
 uniform vec3 uRo; uniform mat3 uCam; uniform float uTan, uTime; uniform vec2 uRes; uniform sampler2D uCoast; uniform vec4 uCR;
 layout(location=0) out vec4 o; layout(location=1) out vec4 oDep;
+uniform vec3 uSun;
+const vec3 SUN=vec3(1.,.94,.84)*3.6, SUNL=vec3(1.,.93,.8)*4.4;
+float shadowH(vec3 p, vec3 L){ return 1.; }
+vec3 skyFill(vec3 N, float v){ return N.y>0.?mix(vec3(.19,.18,.165),vec3(.22,.37,.52),N.y):vec3(.05); }
+vec3 skyIrr(vec3 N){ return N.y>0.?mix(vec3(.36,.45,.58),vec3(.17,.29,.58),N.y):vec3(.06); }
+vec3 skyRefl(vec3 rd, float r){ return mix(vec3(.62,.71,.83),vec3(.27,.43,.74),clamp(rd.y*3.,0.,1.))*.84; }
+vec3 fogApply(vec3 c, vec3 ro, vec3 rd, float t){ return c; }
 float oceanH(vec2 p, float pix){ return .35*sin(dot(p,vec2(.06,.03))+uTime*1.1)+.25*sin(dot(p,vec2(-.02,.08))+uTime*1.7)+.08*sin(dot(p,vec2(.2,.13))+uTime*3.); }
 void main(){
   vec2 uv=(2.*gl_FragCoord.xy-uRes)/uRes.y; vec3 rd=normalize(uCam*vec3(uv*uTan,1.)), ro=uRo;
@@ -106,147 +114,249 @@ void main(){
     return G;
   }
 
-  // ---------------------------------------------------------------- meshes (local: x right, y up, z forward)
+  // ---------------------------------------------------------------- meshes (local: x right, y up, z forward), smooth normals
+  // vertex: position, normal, material id. Every surface is a parametric patch P(u, v); its normals come from P's
+  // derivatives, oriented away from an interior point, so curved hulls shade smoothly and creases stay crisp.
   function MB() {
     const a = [], o = {
       a,
-      tri(p, q, r, m) { a.push(p[0], p[1], p[2], m, q[0], q[1], q[2], m, r[0], r[1], r[2], m); return o; },
-      quad(p, q, r, s, m) { o.tri(p, q, r, m); o.tri(p, r, s, m); return o; },
-      box(x0, y0, z0, x1, y1, z1, m) {
-        const P = (i) => [i & 1 ? x1 : x0, i & 2 ? y1 : y0, i & 4 ? z1 : z0];
-        o.quad(P(0), P(1), P(3), P(2), m); o.quad(P(4), P(5), P(7), P(6), m);
-        o.quad(P(0), P(1), P(5), P(4), m); o.quad(P(2), P(3), P(7), P(6), m);
-        o.quad(P(0), P(2), P(6), P(4), m); o.quad(P(1), P(3), P(7), P(5), m);
+      patch(P, nu, nv, m, inside) {
+        const N = (u, v) => {
+          for (const k of [0, 0.01, 0.03]) {
+            const uu = clamp(u, k, 1 - k), vv = clamp(v, k, 1 - k), e = 1e-3;
+            const n = v3.cross(v3.sub(P(Math.min(uu + e, 1), vv), P(Math.max(uu - e, 0), vv)), v3.sub(P(uu, Math.min(vv + e, 1)), P(uu, Math.max(vv - e, 0))));
+            const l = v3.len(n); if (l > 1e-10) return v3.mul(n, 1 / l);
+          }
+          return [0, 1, 0];
+        };
+        const sg = v3.dot(N(0.5, 0.5), v3.sub(P(0.5, 0.5), inside)) < 0 ? -1 : 1;
+        const V = [];
+        for (let j = 0; j <= nv; j++) for (let i = 0; i <= nu; i++) V.push([P(i / nu, j / nv), v3.mul(N(i / nu, j / nv), sg)]);
+        const put = (k) => { const [p, n] = V[k]; a.push(p[0], p[1], p[2], n[0], n[1], n[2], m); };
+        for (let j = 0; j < nv; j++) for (let i = 0; i < nu; i++) {
+          const k = j * (nu + 1) + i;
+          put(k); put(k + 1); put(k + nu + 2); put(k); put(k + nu + 2); put(k + nu + 1);
+        }
         return o;
       },
-      lathe(rings, seg) {   // rings [[radius, y, material of the band above], ...] bottom to top
-        const p = (r, y, t) => [r * Math.cos(t), y, r * Math.sin(t)];
-        for (let k = 0; k + 1 < rings.length; k++) for (let i = 0; i < seg; i++) {
-          const t0 = i / seg * 2 * Math.PI, t1 = (i + 1) / seg * 2 * Math.PI, [r0, y0, m] = rings[k], [r1, y1] = rings[k + 1];
-          o.quad(p(r0, y0, t0), p(r0, y0, t1), p(r1, y1, t1), p(r1, y1, t0), m);
+      // superellipsoid (rounded box / capsule shapes): e = squareness (small = boxy)
+      blob(c, r, e1, e2, m, nu = 24, nv = 14) {
+        const sp = (x, e) => Math.sign(x) * Math.pow(Math.abs(x), e);
+        return o.patch((u, v) => {
+          const th = (v - 0.5) * Math.PI, ph = u * 2 * Math.PI, ct = sp(Math.cos(th), e1);
+          return [c[0] + r[0] * ct * sp(Math.cos(ph), e2), c[1] + r[1] * sp(Math.sin(th), e1), c[2] + r[2] * ct * sp(Math.sin(ph), e2)];
+        }, nu, nv, m, c);
+      },
+      // surface of revolution from a profile [[radius, y], ...] (bottom to top), one patch per band
+      lathe(prof, m, seg = 28) {
+        for (let k = 0; k + 1 < prof.length; k++) {
+          const [r0, y0] = prof[k], [r1, y1] = prof[k + 1], mm = typeof m === 'function' ? m(k) : m;
+          o.patch((u, v) => { const r = r0 + (r1 - r0) * v, t = u * 2 * Math.PI; return [r * Math.cos(t), y0 + (y1 - y0) * v, r * Math.sin(t)]; }, seg, 2, mm, [0, (y0 + y1) / 2, 0]);
         }
         return o;
       },
     };
     return o;
   }
-  // materials: 0 hull, 1 trim, 2 bottom, 3 deck, 5 glass, 6 engine, 7 pylon, 8 pylon band, 9 checker, 10 pole, 11 beam, 12 shadow
+  // materials: 0 topsides, 1 trim, 2 bottom, 3 deck, 4 rub rail, 5 glass, 6 engine, 7 pylon, 8 pylon band, 9 banner, 10 pole, 11 beam
+  // A 9.4 m offshore V-bottom racer: fine entry, rising sheer, deep-vee bottom, bubble canopy, twin outboards, stern wing.
   function boatMesh() {
-    const B = MB(), NS = 18, st = [];
-    for (let i = 0; i <= NS; i++) {
-      const u = i / NS, w = 1.32 * (u < 0.45 ? 1 : Math.sqrt(Math.max(0, 1 - ((u - 0.45) / 0.55) ** 2)));
-      st.push({ u, z: -4.5 + 9.2 * u, w, hs: 0.78 + 0.32 * u * u, hc: -0.1 + 0.5 * smoothstep(0.5, 1, u), hk: -0.48 + 0.9 * smoothstep(0.55, 1, u) ** 1.5 });
+    const B = MB(), Z = (u) => -4.6 + 9.4 * u;
+    const beam = (u) => 1.3 * (u < 0.36 ? 1 : Math.pow(Math.max(0, 1 - Math.pow((u - 0.36) / 0.64, 2.3)), 0.55));
+    const sheer = (u) => 0.72 + 0.4 * Math.pow(u, 2.4);
+    const chine = (u) => -0.14 + 0.62 * smoothstep(0.45, 1, u);
+    const keel = (u) => -0.52 + 1.02 * Math.pow(smoothstep(0.5, 1, u), 1.35);
+    const crown = 0.12, mid = (u) => [0, 0.2 + 0.2 * u, Z(u)];
+    for (const s of [-1, 1]) {
+      const inside = [0, 0.25, 0];
+      B.patch((u, v) => [s * beam(u) * (1 - 0.04 * v), sheer(u) + (chine(u) - sheer(u)) * v, Z(u)], 56, 6, 0, inside);                                    // topsides
+      B.patch((u, v) => [s * beam(u) * 0.96 * (1 - v), chine(u) - 0.02 + (keel(u) - chine(u) + 0.02) * v - 0.05 * Math.sin(Math.PI * v) * (1 - u), Z(u)], 56, 8, 2, inside);   // vee bottom
+      B.patch((u, v) => [s * beam(u) * (1 - v), sheer(u) + crown * (1 - (1 - v) * (1 - v)), Z(u)], 56, 6, 3, [0, -1, 0]);                                // deck
+      B.patch((u, v) => { const t = v * 2 * Math.PI, w = beam(Math.min(u, 0.985)); return [s * (w + 0.03 + 0.045 * Math.cos(t)), sheer(u) - 0.03 + 0.045 * Math.sin(t), Z(u)]; }, 56, 6, 4, [0, 0.2, 0]);   // rub rail
     }
-    const pt = (s, sd, k) => k === 0 ? [sd * s.w, s.hs, s.z] : k === 1 ? [sd * s.w * 0.995, s.hs - 0.2, s.z] : k === 2 ? [sd * s.w * 0.95, s.hc, s.z] : k === 3 ? [0, s.hk, s.z] : [0, s.hs + 0.1, s.z];
-    for (let i = 0; i < NS; i++) {
-      const a = st[i], b = st[i + 1];
-      for (const sd of [-1, 1]) {
-        B.quad(pt(a, sd, 0), pt(b, sd, 0), pt(b, sd, 1), pt(a, sd, 1), 1);
-        B.quad(pt(a, sd, 1), pt(b, sd, 1), pt(b, sd, 2), pt(a, sd, 2), 0);
-        B.quad(pt(a, sd, 2), pt(b, sd, 2), pt(b, sd, 3), pt(a, sd, 3), 2);
-        B.quad(pt(a, sd, 0), pt(b, sd, 0), pt(b, sd, 4), pt(a, sd, 4), a.u > 0.62 ? 0 : 3);
-      }
+    // transom
+    const b0 = beam(0), top = (x) => sheer(0) + crown * (1 - (x / b0) ** 2), bot = (x) => Math.abs(x) < 0.96 * b0 ? keel(0) + (chine(0) - 0.02 - keel(0)) * Math.abs(x) / (0.96 * b0) : chine(0);
+    B.patch((u, v) => { const x = (2 * u - 1) * b0 * 0.999; return [x, bot(x) + (top(x) - bot(x)) * v, Z(0)]; }, 24, 4, 0, [0, 0.2, 0]);
+    // bubble canopy (teardrop dome), glass with a hull-coloured frame
+    B.patch((u, v) => {
+      const ph = u * 2 * Math.PI, th = v * Math.PI / 2, rh = Math.pow(Math.cos(th), 0.75), sp = Math.sin(ph);
+      return [0.84 * Math.cos(ph) * rh, 0.8 + 0.62 * Math.pow(Math.sin(th), 0.85), -1.45 + (sp > 0 ? 1.75 : 1.05) * sp * rh];
+    }, 40, 12, 5, [0, 0.6, -1.45]);
+    // twin outboards: cowl, bracket, leg, cavitation plate, and a stern wing on two struts
+    for (const x of [-0.56, 0.56]) {
+      B.blob([x, 0.98, -5.12], [0.3, 0.46, 0.43], 0.32, 0.38, 6).blob([x, 0.42, -4.8], [0.17, 0.24, 0.22], 0.3, 0.3, 6);
+      B.blob([x, 0.02, -5.02], [0.085, 0.62, 0.22], 0.5, 0.42, 6).blob([x, -0.32, -5.0], [0.2, 0.025, 0.3], 0.3, 0.4, 6, 18, 6);
+      B.blob([x * 1.62, 1.2, -4.05], [0.035, 0.32, 0.12], 0.4, 0.4, 6, 12, 8);
     }
-    const s0 = st[0], c = [0, (s0.hs + s0.hk) / 2, s0.z];
-    const ring = [pt(s0, 1, 4), pt(s0, 1, 0), pt(s0, 1, 1), pt(s0, 1, 2), pt(s0, 1, 3), pt(s0, -1, 2), pt(s0, -1, 1), pt(s0, -1, 0), pt(s0, -1, 4)];
-    for (let k = 0; k + 1 < ring.length; k++) B.tri(c, ring[k], ring[k + 1], 0);
-    // canopy: sloped glass front and sides, hull-coloured roof
-    const bz0 = -3.0, bz1 = -0.2, tz0 = -2.6, tz1 = -1.25, by = 0.8, ty = 1.42, bw = 0.86, tw = 0.56;
-    const b00 = [-bw, by, bz0], b10 = [bw, by, bz0], b01 = [-bw, by, bz1], b11 = [bw, by, bz1];
-    const t00 = [-tw, ty, tz0], t10 = [tw, ty, tz0], t01 = [-tw, ty, tz1], t11 = [tw, ty, tz1];
-    B.quad(b01, b11, t11, t01, 5).quad(b00, b01, t01, t00, 5).quad(b10, b11, t11, t10, 5).quad(t00, t10, t11, t01, 0).quad(b00, b10, t10, t00, 0);
-    // twin outboards and a stern wing
-    for (const sx of [-0.55, 0.55]) {
-      B.box(sx - 0.3, 0.35, -5.2, sx + 0.3, 1.25, -4.4, 6).box(sx - 0.31, 0.95, -5.21, sx + 0.31, 1.06, -4.39, 1).box(sx - 0.1, -0.65, -5.0, sx + 0.1, 0.4, -4.6, 6);
-      B.box(sx * 1.6 - 0.04, 0.9, -4.15, sx * 1.6 + 0.04, 1.4, -3.9, 6);
-    }
-    B.box(-1.15, 1.38, -4.35, 1.15, 1.46, -3.7, 1);
+    B.blob([0, 1.53, -4.05], [1.18, 0.045, 0.3], 0.25, 0.3, 1, 28, 8);
     return new Float32Array(B.a);
   }
-  const pylonMesh = () => new Float32Array(MB().lathe([[1.25, -0.8, 7], [1.3, 0.2, 7], [1.05, 0.55, 7], [0.78, 2.2, 8], [0.66, 2.75, 7], [0.12, 4.4, 7], [0, 4.5, 7]], 14).a);
-  const beamMesh = () => new Float32Array(MB().lathe([[0.9, 0, 11], [0.9, 70, 11]], 10).a);
-  const shadowMesh = () => new Float32Array(MB().quad([-1.6, 0, -5], [1.6, 0, -5], [1.6, 0, 5], [-1.6, 0, 5], 12).a);
+  // inflatable racing pylon: a fat base collar, a long cone, a white band
+  const pylonMesh = (sc = 1) => new Float32Array(MB().lathe([[1.15, -0.8], [1.3, -0.1], [1.32, 0.15], [1.2, 0.45], [0.98, 0.75], [0.8, 2.1], [0.72, 2.75], [0.38, 3.9], [0.16, 4.4], [0.0, 4.55]].map(([r, y]) => [r, y * sc]), (k) => (k === 5 ? 8 : 7)).a);
+  const beamMesh = () => new Float32Array(MB().lathe([[0.9, 0], [0.9, 70]], 11, 12).a);
   function bannerMesh(g) {   // start / finish: two poles and a chequered banner, in the gate's frame
     const B = MB();
-    B.box(-g.hl - 0.12, -0.5, -0.12, -g.hl + 0.12, 8.6, 0.12, 10).box(g.hr - 0.12, -0.5, -0.12, g.hr + 0.12, 8.6, 0.12, 10);
-    B.quad([-g.hl, 6.6, 0], [g.hr, 6.6, 0], [g.hr, 8.4, 0], [-g.hl, 8.4, 0], 9);
+    for (const x of [-g.hl, g.hr]) B.blob([x, 4.1, 0], [0.11, 4.6, 0.11], 1, 1, 10, 12, 4);
+    B.patch((u, v) => [-g.hl + (g.hl + g.hr) * u, 6.6 + 1.8 * v + 0.12 * Math.sin(u * Math.PI), 0.15 * Math.sin(u * Math.PI)], 40, 2, 9, [0, 7.5, -10]);
     return new Float32Array(B.a);
   }
 
   // ---------------------------------------------------------------- GL
+  // The object, wake and spray shaders are compiled on top of the scene shader (G.prefix = the render source without its
+  // main), so they use its sun (SUN / SUNL), sky fill, sky reflections, terrain shadows (shadowH) and haze (fogApply):
+  // the boats are lit by the same light as the cliffs and the sea. renderSample(..., P0, drawFn) sets all its uniforms.
   const VS_OBJ = `#version 300 es
-layout(location=0) in vec3 aP; layout(location=1) in float aM;
-uniform mat4 uVP, uM; out vec3 vW, vL; flat out float vM;
-void main(){ vec4 w=uM*vec4(aP,1.); vW=w.xyz; vL=aP; vM=aM; gl_Position=uVP*w; }`;
-  const FS_OBJ = `#version 300 es
-precision highp float; precision highp sampler2D;
-uniform sampler2D uDep; uniform vec3 uCamP, uSun, uC0, uC1; uniform float uBias, uGlow;
-in vec3 vW, vL; flat in float vM; out vec4 o;
+layout(location=0) in vec3 aP; layout(location=1) in vec3 aN; layout(location=2) in float aM;
+uniform mat4 uRVP, uRM; out vec3 vW, vN, vL; flat out float vM;
+void main(){ vec4 w=uRM*vec4(aP,1.); vW=w.xyz; vN=mat3(uRM)*aN; vL=aP; vM=aM; gl_Position=uRVP*w; }`;
+  const VS_SHADOW = `#version 300 es
+layout(location=0) in vec3 aP;
+uniform mat4 uRLVP, uRM;
+void main(){ gl_Position=uRLVP*(uRM*vec4(aP,1.)); }`;
+  const FS_SHADOW = `#version 300 es
+precision highp float; void main(){}`;
+  const RSHADOW = `
+uniform sampler2D uRShad; uniform mat4 uRLVP;
+float rShadow(vec3 p){   // boats / pylons shadow map, 3x3 PCF
+  vec4 q=uRLVP*vec4(p,1.); vec3 s=q.xyz*.5+.5;
+  if(s.x<0.||s.y<0.||s.x>1.||s.y>1.||s.z>1.) return 1.;
+  vec2 ts=1.4/vec2(textureSize(uRShad,0)); float r=0.;
+  for(int j=-1;j<=1;j++) for(int i=-1;i<=1;i++) r+=step(s.z-.0006,texture(uRShad,s.xy+vec2(i,j)*ts).r);
+  return r/9.;
+}
+float rH21(vec2 p){ return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453); }
+float rVn(vec2 p){ vec2 i=floor(p), f=fract(p); f=f*f*(3.-2.*f); return mix(mix(rH21(i),rH21(i+vec2(1,0)),f.x),mix(rH21(i+vec2(0,1)),rH21(i+vec2(1,1)),f.x),f.y); }
+`;
+  const FS_OBJ_MAIN = RSHADOW + `
+uniform sampler2D uRDep; uniform vec3 uRC0, uRC1; uniform float uRGlow, uRBias, uRNum, uRWl;
+in vec3 vW, vN, vL; flat in float vM;
+float rSeg(vec2 p, vec2 a, vec2 b){ vec2 pa=p-a, ba=b-a; return length(pa-ba*clamp(dot(pa,ba)/dot(ba,ba),0.,1.)); }
+float rDigit(vec2 p, int d){   // 7-segment digit, p in [-.5,.5] x [-1,1]: distance to the lit segments
+  int m=d==0?63:d==1?6:d==2?91:d==3?79:d==4?102:d==5?109:d==6?125:d==7?7:d==8?127:111;
+  float r=1e3;
+  if((m&1)!=0) r=min(r,rSeg(p,vec2(-.38,.9),vec2(.38,.9)));
+  if((m&2)!=0) r=min(r,rSeg(p,vec2(.4,.88),vec2(.4,.02)));
+  if((m&4)!=0) r=min(r,rSeg(p,vec2(.4,-.02),vec2(.4,-.88)));
+  if((m&8)!=0) r=min(r,rSeg(p,vec2(-.38,-.9),vec2(.38,-.9)));
+  if((m&16)!=0) r=min(r,rSeg(p,vec2(-.4,-.02),vec2(-.4,-.88)));
+  if((m&32)!=0) r=min(r,rSeg(p,vec2(-.4,.88),vec2(-.4,.02)));
+  if((m&64)!=0) r=min(r,rSeg(p,vec2(-.38,0.),vec2(.38,0.)));
+  return r;
+}
+float rGGX(vec3 N, vec3 V, vec3 L, float a){
+  vec3 H=normalize(V+L); float nh=max(dot(N,H),0.), a2=a*a, dd=nh*nh*(a2-1.)+1.;
+  float k=a*.5, nv=max(dot(N,V),1e-3), nl=max(dot(N,L),1e-3);
+  return a2/(3.14159*dd*dd)*nv/(nv*(1.-k)+k)*nl/(nl*(1.-k)+k)/(4.*nv*nl);
+}
 void main(){
-  float d=length(vW-uCamP);
-  if(texelFetch(uDep,ivec2(gl_FragCoord.xy),0).r<d-(uBias+.003*d)) discard;   // behind the ray-marched water / land
+  float d=length(vW-uRo), gap=texelFetch(uRDep,ivec2(gl_FragCoord.xy),0).r-d;
+  if(gap<-(uRBias+.003*d)) discard;   // behind the ray-marched water / land
   int m=int(vM+.5);
-  if(m==11){ float k=clamp(vL.y/70.,0.,1.); o=vec4(vec3(1.,.72,.22)*(1.-k)*(1.-k)*uGlow*.3,0.); return; }
-  if(m==12){ float r=length(vL.xz/vec2(1.6,5.)); o=vec4(0.,0.,0.,.3*smoothstep(1.,.4,r)); return; }
-  vec3 V=normalize(uCamP-vW), n=normalize(cross(dFdx(vW),dFdy(vW))); if(dot(n,V)<0.) n=-n;
-  vec3 alb=vec3(.8); float ks=.04, sp=60.;
-  if(m==0){ alb=uC0; ks=.08; sp=120.; }
-  else if(m==1){ alb=uC1; ks=.08; sp=120.; }
-  else if(m==2){ alb=uC0*.35+.015; ks=.03; sp=30.; }
-  else if(m==3){ alb=vec3(.78,.78,.76); ks=.05; sp=80.; }
-  else if(m==5){ alb=vec3(.012,.016,.024); ks=1.; sp=500.; }
-  else if(m==6){ alb=vec3(.022); ks=.15; sp=150.; }
-  else if(m==7){ alb=uC0; ks=.05; sp=40.; }
-  else if(m==8){ alb=vec3(.85); ks=.05; sp=40.; }
-  else if(m==9){ alb=vec3(mod(floor(vL.x*.85)+floor(vL.y*1.1),2.)*.84+.02); ks=.02; sp=10.; }
-  else if(m==10){ alb=vec3(.35,.36,.38); ks=.3; sp=60.; }
-  vec3 SUNC=vec3(1.,.93,.8)*4.4;
-  float ndl=max(dot(n,uSun),0.);
-  vec3 sky=vec3(.32,.5,.85)*(.6+.4*n.y)*.9+vec3(.04,.12,.16)*max(-n.y,0.);
-  vec3 H=normalize(uSun+V); float fr=.04+.96*pow(1.-max(dot(n,V),0.),5.);
-  vec3 env=mix(vec3(.12,.25,.38),vec3(.55,.75,1.1),clamp(reflect(-V,n).y*2.+.5,0.,1.));
-  vec3 col=alb*(SUNC*ndl+sky)+ks*(SUNC*pow(max(dot(n,H),0.),sp)*(sp+8.)/25.*ndl+env*fr*1.5);
-  if(m==7||m==8) col+=alb*uGlow*.7;
-  col=mix(col,vec3(.62,.75,.92)*1.3,1.-exp(-d*.00012));
-  o=vec4(col,1.);
+  vec3 V=normalize(uRo-vW), rd=-V, L=vL;
+  if(m==11){ float k=clamp(L.y/70.,0.,1.); o=vec4(vec3(1.,.72,.22)*(1.-k)*(1.-k)*uRGlow*.25,0.); return; }
+  vec3 N=normalize(vN); if(m==9&&dot(N,V)<0.) N=-N;
+  vec3 alb=vec3(.8); float rough=.1, f0=.04, coat=1., metal=0.;
+  if(m==0){   // topsides: hull colour, a trim stripe sweeping down aft, a pinstripe, the race number in a white roundel
+    alb=uRC0; rough=.07;
+    float sw=L.y-(.6-.06*L.z), band=smoothstep(.012,0.,abs(sw)-.075), pin=smoothstep(.01,0.,abs(sw+.14)-.014);
+    alb=mix(alb,uRC1,band); alb=mix(alb,vec3(.86),pin*(1.-band));
+    vec2 q=vec2((L.z-1.15)*sign(L.x),L.y-.3)/.27;
+    float rr=length(q);
+    if(rr<1.&&abs(L.x)>.3){
+      alb=mix(alb,vec3(.86),smoothstep(1.,.96,rr));
+      int n=int(uRNum+.5); float dg=n<10?rDigit(q/.52,n):min(rDigit(vec2(q.x+.31,q.y)/.52,n/10),rDigit(vec2(q.x-.31,q.y)/.52,n-n/10*10));
+      alb=mix(alb,vec3(.02),smoothstep(.15,.11,dg)*step(rr,.95));
+    }
+  }
+  else if(m==1){ alb=uRC1; rough=.07; }
+  else if(m==2){ alb=uRC0*.35+.03; rough=.3; coat=.5; }
+  else if(m==3){   // deck: white, hull-coloured foredeck behind a trim line, a grey non-skid panel aft
+    alb=vec3(.82,.82,.8); rough=.09;
+    float fd=smoothstep(1.35,1.4,L.z); alb=mix(alb,uRC0,fd); alb=mix(alb,uRC1,smoothstep(.03,0.,abs(L.z-1.33)-.03));
+    if(L.z<-2.95&&L.z>-4.45&&abs(L.x)<.95){ alb=vec3(.2,.21,.22); rough=.6; coat=.2; }
+  }
+  else if(m==4){ alb=vec3(.025); rough=.25; }
+  else if(m==5){   // canopy: smoked glass in a hull-coloured frame
+    alb=vec3(.006,.008,.012); rough=.02; f0=.05;
+    if(L.y<.9||abs(L.x)<.07&&L.z>-1.9){ alb=uRC0; rough=.07; f0=.04; }
+  }
+  else if(m==6){ alb=vec3(.018); rough=.09; if(abs(L.y-1.15)<.05) alb=uRC1; }
+  else if(m==7){ alb=uRC0; rough=.38; coat=.35; }
+  else if(m==8){ alb=vec3(.86); rough=.38; coat=.35; }
+  else if(m==9){ alb=vec3(mod(floor((L.x+60.)*.9)+floor((L.y-6.6)*1.1),2.)*.84+.03); rough=.8; coat=0.; }
+  else if(m==10){ alb=vec3(.75,.76,.78); rough=.22; metal=1.; }
+  float ao=mix(.5,1.,smoothstep(-.5,.9,L.y))*(.75+.25*N.y*N.y);
+  // waterline: wet and foamy just above the probed sea level (below it the ray-marched water hides the hull)
+  float wl=m<9&&m!=5?smoothstep(.45,.0,vW.y-uRWl)*(.6+.4*smoothstep(.6,0.,gap)):0.;
+  float fn=rVn(vW.xz*2.3+vec2(uTime*1.7,0.))*.6+rVn(vW.xz*7.-uTime*.9)*.4;
+  alb*=1.-.35*wl;
+  float sh=min(shadowH(vW+N*.3,uSun),rShadow(vW+N*.05));
+  float ndl=max(dot(N,uSun),0.);
+  vec3 F0=mix(vec3(f0),alb,metal), H=normalize(V+uSun);
+  vec3 Fv=F0+(1.-F0)*pow(1.-max(dot(N,V),0.),5.), Fh=F0+(1.-F0)*pow(1.-max(dot(H,V),0.),5.);
+  vec3 R=reflect(rd,N);
+  vec3 env=R.y>.0?skyRefl(R,rough):mix(vec3(.012,.04,.065),skyRefl(normalize(vec3(R.x,.02,R.z)),rough),.3);   // below the horizon: the sea
+  vec3 col=alb*(1.-metal)*(1.-Fv*coat)*(SUNL*ndl*sh+skyFill(N,0.)*3.2*ao)
+          +coat*(Fv*env*mix(.6,1.,ao)+SUNL*rGGX(N,V,uSun,max(rough,.025))*Fh*ndl*sh);
+  if(m==7||m==8) col+=alb*uRGlow*.6;
+  vec3 foamC=(SUN*((max(dot(N,uSun),0.)+.35)/1.35)*sh+skyIrr(N)*1.05)*vec3(.585,.665,.765);
+  col=mix(col,foamC,wl*smoothstep(.45,.75,fn)*.85);
+  o=vec4(fogApply(col,uRo,rd,d),1.);
 }`;
   const VS_WAKE = `#version 300 es
 layout(location=0) in vec3 aP; layout(location=1) in vec4 aW; layout(location=2) in float aD;
-uniform mat4 uVP; out vec3 vW; out vec4 vA; out float vD;
-void main(){ vW=aP; vA=aW; vD=aD; gl_Position=uVP*vec4(aP,1.); }`;
-  const NOISE = `
-float h21(vec2 p){ return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453); }
-float vn(vec2 p){ vec2 i=floor(p), f=fract(p); f=f*f*(3.-2.*f); return mix(mix(h21(i),h21(i+vec2(1,0)),f.x),mix(h21(i+vec2(0,1)),h21(i+vec2(1,1)),f.x),f.y); }`;
-  const FS_WAKE = `#version 300 es
-precision highp float; precision highp sampler2D;
-uniform sampler2D uDep; uniform vec3 uCamP; uniform float uT;
-in vec3 vW; in vec4 vA; in float vD; out vec4 o;` + NOISE + `
+uniform mat4 uRVP; out vec3 vW; out vec4 vA; out float vD;
+void main(){ vW=aP; vA=aW; vD=aD; gl_Position=uRVP*vec4(aP,1.); }`;
+  const FS_WAKE_MAIN = RSHADOW + `
+uniform sampler2D uRDep;
+in vec3 vW; in vec4 vA; in float vD;
 void main(){
-  float d=length(vW-uCamP);
-  if(texelFetch(uDep,ivec2(gl_FragCoord.xy),0).r<d-(2.+.01*d)) discard;
+  float d=length(vW-uRo), gap=texelFetch(uRDep,ivec2(gl_FragCoord.xy),0).r-d;
+  if(gap<-.5) discard;   // under a wave crest
   float x=vA.x*vA.w, age=vA.y, I=vA.z, w=vA.w;   // x: metres across the wake, w: its half width
-  float n=vn(vec2(x*.8,vD*.18)+3.7)*.6+vn(vW.xz*.7+vec2(uT*.15,0.))*.4;   // streaks along the wake + slow churn
-  float qa=(abs(x)-w*.88)/(.4+.06*w), qw=x/(.9+4.*age);
-  float arms=exp(-qa*qa)*smoothstep(.015,.1,age)*pow(1.-age,2.)*.6;   // the Kelvin arms separate from the wash behind the stern
+  float n=rVn(vec2(x*.9,vD*.35)+3.7)*.5+rVn(vW.xz*.8+vec2(uTime*.15,0.))*.3+rVn(vW.xz*2.6)*.2;   // streaks along the wake + churn
+  float n2=rVn(vec2(x*3.1,vD*1.4)+1.3)*.6+rVn(vW.xz*6.)*.4;
+  float qa=(abs(x)-w*.76)/(.4+.06*w), qw=x/(1.3+5.*age), edge=smoothstep(1.,.86,abs(x)/w);   // nothing reaches the ribbon's border
+  float arms=exp(-qa*qa)*smoothstep(.015,.1,age)*pow(1.-age,2.)*.65;   // the Kelvin arms separate from the wash behind the stern
   float wash=exp(-qw*qw)*pow(1.-age,1.5);
-  float foam=clamp(arms*smoothstep(.45,.8,n)+wash*smoothstep(.55,.85,n)*.7,0.,1.)*I;
-  float aer=wash*.5*I*(1.-foam);   // turquoise aerated water between the foam streaks
-  o=vec4(vec3(.88,.94,.97)*1.8*foam+vec3(.08,.34,.38)*aer,foam+aer);
+  float foam=clamp(arms*smoothstep(.42,.8,n)*(.6+.4*n2)+wash*smoothstep(.25+.45*age,.75,n)*(.6+.4*n2)*(1.-.4*age),0.,1.)*I*edge*smoothstep(-.5,.1,gap);   // white churn behind the stern breaking into streaks
+  float aer=wash*.32*I*(1.-foam)*smoothstep(-.5,.1,gap);   // turquoise aerated water between the foam streaks
+  float sh=rShadow(vW);
+  vec3 foamC=(SUN*((max(uSun.y,0.)+.35)/1.35)*mix(.3,1.,sh)+skyIrr(vec3(0,1,0))*1.05)*vec3(.585,.665,.765);
+  vec3 aerC=vec3(.05,.27,.3)*(SUN.g*max(uSun.y,0.)*.25*mix(.4,1.,sh)+.35);
+  float a=foam+aer; if(a<.002) discard;
+  vec3 c=(foamC*foam+aerC*aer)/a;
+  o=vec4(fogApply(c,uRo,normalize(vW-uRo),d)*a,a);
 }`;
   const VS_PART = `#version 300 es
 layout(location=0) in vec3 aP; layout(location=1) in vec2 aS;
-uniform mat4 uVP; uniform vec3 uCamP; uniform float uPix, uPmax; out float vA; out vec3 vW;
-void main(){ float d=length(aP-uCamP); vW=aP; vA=aS.y*smoothstep(4.,12.,d); gl_Position=uVP*vec4(aP,1.); gl_PointSize=clamp(aS.x*uPix/max(d,.5),1.,uPmax); }`;
-  const FS_PART = `#version 300 es
-precision highp float; precision highp sampler2D;
-uniform sampler2D uDep; uniform vec3 uCamP;
-in float vA; in vec3 vW; out vec4 o;
+uniform mat4 uRVP; uniform vec3 uRCam; uniform float uRPix, uRPmax; out float vA; out vec3 vW;
+void main(){ float d=length(aP-uRCam); vW=aP; vA=aS.y*smoothstep(3.,9.,d); gl_Position=uRVP*vec4(aP,1.); gl_PointSize=clamp(aS.x*uRPix/max(d,.5),1.,uRPmax); }`;
+  const FS_PART_MAIN = RSHADOW + `
+uniform sampler2D uRDep;
+in float vA; in vec3 vW;
 void main(){
-  float d=length(vW-uCamP);
-  if(texelFetch(uDep,ivec2(gl_FragCoord.xy),0).r<d-(.6+.004*d)) discard;
-  float r=length(gl_PointCoord-.5)*2., a=smoothstep(1.,.25,r)*vA;
-  o=vec4(vec3(.92,.96,1.)*2.4*a,a);
+  vec2 pc=gl_PointCoord*2.-1.; float r=dot(pc,pc); if(r>1.) discard;
+  float d=length(vW-uRo), soft=clamp((texelFetch(uRDep,ivec2(gl_FragCoord.xy),0).r-d)/1.2,0.,1.);
+  float a=vA*pow(1.-r,1.6)*soft*(.65+.35*rH21(gl_PointCoord*7.+vW.xz)); if(a<.002) discard;
+  vec3 rd=normalize(vW-uRo); float mu=max(dot(rd,uSun),0.);
+  vec3 c=SUN*(.3+1.6*pow(mu,8.))*mix(.35,1.,rShadow(vW))*vec3(.82,.87,.92)+skyIrr(vec3(0,1,0))*1.1;   // droplets: bright toward the sun
+  o=vec4(fogApply(c,uRo,rd,d)*a,a);
 }`;
+  // the boats' shadows on the ray-marched scene (water, rocks): darken where the shadow map sees a hull
+  const FS_WSHADOW = `#version 300 es
+precision highp float; precision highp sampler2D;
+uniform sampler2D uRDep; uniform vec3 uRCam; uniform mat3 uRB; uniform float uRTan; uniform vec2 uRRes, uRJit;
+out vec4 o;` + RSHADOW + `
+void main(){
+  float t=texelFetch(uRDep,ivec2(gl_FragCoord.xy),0).r; if(t>300.) discard;
+  vec2 uv=(2.*(gl_FragCoord.xy+uRJit)-uRRes)/uRRes.y; vec3 rd=normalize(uRB*vec3(uv*uRTan,1.));
+  float s=rShadow(uRCam+rd*t); if(s>.995) discard;
+  o=vec4(vec3(mix(.42,1.,s)),1.);
+}`;
+  const FS_COPY = `#version 300 es
+precision highp float; uniform sampler2D uRSrc; out vec4 o;
+void main(){ o=texelFetch(uRSrc,ivec2(gl_FragCoord.xy),0); }`;
   function progVF(vs, fs) {
     const p = gl.createProgram();
     gl.attachShader(p, sh(gl.VERTEX_SHADER, vs)); gl.attachShader(p, sh(gl.FRAGMENT_SHADER, fs)); gl.linkProgram(p);
@@ -263,13 +373,23 @@ void main(){
     gl.bindVertexArray(vao);
     return { va, b, nf, count: data.length / nf };
   }
-  // column-major view-projection matching the ray march's camera (rd = r*x*tan + u*y*tan + f)
-  function viewProj(cam, aspect, near = 0.4, far = 9000) {
+  // column-major view-projection matching the ray march's camera (rd = r*x*tan + u*y*tan + f), with its sub-pixel jitter
+  function viewProj(cam, aspect, jit = [0, 0], near = 0.3, far = 9000) {
     const t = Math.tan(cam.vfov / 2), sx = 1 / (t * aspect), sy = 1 / t, A = (far + near) / (far - near), Bn = -2 * far * near / (far - near);
     const { r, u, f, pos: p } = cam, dr = v3.dot(r, p), du = v3.dot(u, p), df = v3.dot(f, p);
-    return new Float32Array([sx * r[0], sy * u[0], A * f[0], f[0], sx * r[1], sy * u[1], A * f[1], f[1], sx * r[2], sy * u[2], A * f[2], f[2], -sx * dr, -sy * du, -A * df + Bn, -df]);
+    const jx = -2 * jit[0] / R.w, jy = -2 * jit[1] / R.h;   // the ray of pixel c goes through c + jit
+    const M = [sx * r[0], sy * u[0], A * f[0], f[0], sx * r[1], sy * u[1], A * f[1], f[1], sx * r[2], sy * u[2], A * f[2], f[2], -sx * dr, -sy * du, -A * df + Bn, -df];
+    for (let c = 0; c < 4; c++) { M[c * 4] += jx * M[c * 4 + 3]; M[c * 4 + 1] += jy * M[c * 4 + 3]; }
+    return new Float32Array(M);
   }
-  const modelMat = (r, u, f, p, s = 1) => new Float32Array([r[0], r[1], r[2], 0, u[0] * s, u[1] * s, u[2] * s, 0, f[0], f[1], f[2], 0, p[0], p[1], p[2], 1]);
+  // orthographic sun view around c (shadow map)
+  function lightMat(c, E = 70, D = 160) {
+    const f = v3.mul(sunDir, -1), r = v3.norm(v3.cross([0, 1, 0], f)), u = v3.cross(f, r);
+    const row = (a, s) => [a[0] / s, a[1] / s, a[2] / s, -v3.dot(a, c) / s];
+    const X = row(r, E), Y = row(u, E), Zr = row(f, D);
+    return new Float32Array([X[0], Y[0], Zr[0], 0, X[1], Y[1], Zr[1], 0, X[2], Y[2], Zr[2], 0, X[3], Y[3], Zr[3], 1]);
+  }
+  const modelMat = (r, u, f, p) => new Float32Array([r[0], r[1], r[2], 0, u[0], u[1], u[2], 0, f[0], f[1], f[2], 0, p[0], p[1], p[2], 1]);
   function boatBasis(b) {
     const sy = Math.sin(b.yaw), cy = Math.cos(b.yaw), cp = Math.cos(b.pitch), sp = Math.sin(b.pitch), cr = Math.cos(b.roll), sr = Math.sin(b.roll);
     const f0 = [sy, 0, cy], r0 = [cy, 0, -sy], u0 = [0, 1, 0];
@@ -288,16 +408,21 @@ void main(){
     gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
     PRB.slot = [0, 1, 2].map(() => null); PRB.buf = new Float32Array(PRB.N * 4); PRB.u = new Float32Array(PRB.N * 4);
   }
-  function probeIssue(cam, time, pts) {
-    if (!PRB.p) return;
-    const k = PRB.slot.findIndex((s) => !s); if (k < 0) return;
+  function probeDraw(cam, time, pts, after) {
     const n = Math.min(pts.length, PRB.N);
-    for (let i = 0; i < n; i++) { PRB.u[i * 4] = pts[i].x; PRB.u[i * 4 + 1] = pts[i].z; PRB.u[i * 4 + 2] = 1.5; }
+    for (let i = 0; i < n; i++) { PRB.u[i * 4] = pts[i].x; PRB.u[i * 4 + 1] = pts[i].z; PRB.u[i * 4 + 2] = pts[i].pix || 1.5; }
     renderSample(cam, time, [0, 0], true, PRB.p, (P) => {
       gl.uniform4fv(P.u.uPrb, PRB.u);
       gl.bindFramebuffer(gl.FRAMEBUFFER, PRB.f); gl.viewport(0, 0, PRB.N, 1); gl.drawArrays(gl.TRIANGLES, 0, 3);
-      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, PRB.pbo[k]); gl.readPixels(0, 0, PRB.N, 1, gl.RGBA, gl.FLOAT, 0); gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+      after();
     });
+    return n;
+  }
+  const probeApply = (pts, n) => { for (let i = 0; i < n; i++) { const h = PRB.buf[i * 4]; if (isFinite(h) && Math.abs(h) < 20) pts[i].o.h[pts[i].k] = h; } };
+  function probeIssue(cam, time, pts) {   // async (PBO + fence): read back a frame or two later
+    if (!PRB.p) return;
+    const k = PRB.slot.findIndex((s) => !s); if (k < 0) return;
+    const n = probeDraw(cam, time, pts, () => { gl.bindBuffer(gl.PIXEL_PACK_BUFFER, PRB.pbo[k]); gl.readPixels(0, 0, PRB.N, 1, gl.RGBA, gl.FLOAT, 0); gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null); });
     PRB.slot[k] = { fence: gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0), pts: pts.slice(0, n), seq: PRB.seq++ };
   }
   function probePoll() {
@@ -308,8 +433,13 @@ void main(){
     for (const k of ready) {
       const s = PRB.slot[k]; gl.deleteSync(s.fence); PRB.slot[k] = null;
       gl.bindBuffer(gl.PIXEL_PACK_BUFFER, PRB.pbo[k]); gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, PRB.buf); gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
-      s.pts.forEach((p, i) => { const h = PRB.buf[i * 4]; if (isFinite(h) && Math.abs(h) < 20) p.o.h[p.k] = h; });
+      probeApply(s.pts, s.pts.length);
     }
+  }
+  function probeSync(cam, time, pts) {   // blocking (offline renders)
+    if (!PRB.p) return;
+    const n = probeDraw(cam, time, pts, () => gl.readPixels(0, 0, PRB.N, 1, gl.RGBA, gl.FLOAT, PRB.buf));
+    probeApply(pts, n);
   }
 
   // ---------------------------------------------------------------- audio (synthesised)
@@ -460,7 +590,7 @@ void main(){
   function impact(b, v) {
     if (v < 2) return;
     b.hit = Math.max(b.hit, Math.min(1, v / 15));
-    for (let i = 0; i < Math.min(60, v * 4); i++) spawn(b.x + (Math.random() - 0.5) * 4, b.y + 0.3, b.z + (Math.random() - 0.5) * 4, (Math.random() - 0.5) * 8, 3 + Math.random() * 7, (Math.random() - 0.5) * 8, 0.8 + Math.random() * 0.6, 1 + Math.random() * 1.5);
+    for (let i = 0; i < Math.min(160, v * 10); i++) spawn(b.x + (Math.random() - 0.5) * 4, b.y + 0.3, b.z + (Math.random() - 0.5) * 4, (Math.random() - 0.5) * 8, 3 + Math.random() * 8, (Math.random() - 0.5) * 8, 0.8 + Math.random() * 0.7, 0.15 + Math.random() * 0.5, 0.5);
     if (!b.ai) thud(v / 15); else if (Math.hypot(b.x - G.cam.pos[0], b.z - G.cam.pos[2]) < 60) thud(v / 40);
   }
   function collideBoats() {
@@ -486,36 +616,39 @@ void main(){
   // hull height / pitch / roll: springs toward the probed wave surface (bow, port and starboard quarters)
   function rideWaves(b, dt) {
     const vf = b.vx * Math.sin(b.yaw) + b.vz * Math.cos(b.yaw), sp = Math.abs(vf);
-    const hm = (b.h[0] + b.h[1] + b.h[2]) / 3, plane = 0.28 * smoothstep(8, 26, sp);
+    const hm = (b.h[0] + b.h[1] + b.h[2]) / 3, plane = 0.12 * smoothstep(8, 26, sp);
     const ty = hm + plane;
-    const k = b.y > ty ? 22 : 75;
-    b.vy += (k * (ty - b.y) - 8 * b.vy) * dt; b.y += b.vy * dt;
-    const tp = Math.atan2(b.h[0] - (b.h[1] + b.h[2]) / 2, 7) + 0.07 * smoothstep(3, 14, sp) * (1 - 0.6 * smoothstep(18, 45, sp)) + b.thr * 0.015 + (b.y - ty) * 0.03;
+    const k = b.y > ty ? 90 : 170;   // a 9 m planing hull stays on the surface: brief air off the crests, no long flights
+    b.vy += (k * (ty - b.y) - 1.8 * Math.sqrt(k) * b.vy - 260 * Math.max(0, b.y - ty - 0.25)) * dt; b.y += b.vy * dt;   // air above ~25 cm is pulled down hard
+    const tp = Math.atan2(b.h[0] - (b.h[1] + b.h[2]) / 2, 7) + 0.06 * smoothstep(3, 14, sp) * (1 - 0.65 * smoothstep(18, 45, sp)) + b.thr * 0.015 + (b.y - ty) * 0.03;
     const tr = -Math.atan2(b.h[2] - b.h[1], 2.8) * 0.8 + clamp(b.yawRate * sp * 0.011, -0.32, 0.32);
-    b.vp += (55 * (tp - b.pitch) - 9 * b.vp) * dt; b.pitch += b.vp * dt;
-    b.vr += (45 * (tr - b.roll) - 7 * b.vr) * dt; b.roll += b.vr * dt;
+    b.vp += (90 * (tp - b.pitch) - 15 * b.vp) * dt; b.pitch += b.vp * dt;
+    b.vr += (70 * (tr - b.roll) - 13 * b.vr) * dt; b.roll += b.vr * dt;
   }
-  function spawn(x, y, z, vx, vy, vz, life, size) { if (G.parts.length < 2500) G.parts.push({ x, y, z, vx, vy, vz, t: 0, life, size, y0: y - 0.6 }); }
+  function spawn(x, y, z, vx, vy, vz, life, size, a = 0.45) { if (G.parts.length < 3000) G.parts.push({ x, y, z, vx, vy, vz, t: 0, life, size, a, y0: y - 0.8 }); }
   function emitSpray(b, dt) {
     const fx = Math.sin(b.yaw), fz = Math.cos(b.yaw), rx = fz, rz = -fx, sp = Math.hypot(b.vx, b.vz);
-    const rate = 50 * smoothstep(6, 32, sp) * (b.boosting ? 1.5 : 1) + 90 * Math.abs(b.yawRate) * smoothstep(10, 30, sp) + 30 * smoothstep(1.5, 4, Math.abs(b.vy));
-    b.emit += rate * dt;
-    while (b.emit >= 1) {
-      b.emit--;
-      const q = Math.random();
-      if (q < 0.6) {   // rooster tail behind the props
-        spawn(b.x - fx * 5.1 + (Math.random() - 0.5) * 0.8 * rx, b.y - 0.2, b.z - fz * 5.1 + (Math.random() - 0.5) * 0.8 * rz,
-          b.vx * 0.7 + (Math.random() - 0.5) * 2.5 * rx, 4 + Math.random() * 6 * smoothstep(10, 40, sp), b.vz * 0.7 + (Math.random() - 0.5) * 2.5 * rz,
-          0.5 + Math.random() * 0.5, 0.3 + Math.random() * 0.5);
-      } else {        // bow / chine spray, mostly on the outside of a turn
-        const sd = Math.random() < 0.5 + clamp(b.yawRate, -0.4, 0.4) * -1.1 ? 1 : -1, px = b.x + fx * (1.5 + Math.random() * 2) + rx * sd * 1.3, pz = b.z + fz * (1.5 + Math.random() * 2) + rz * sd * 1.3;
-        spawn(px, b.y - 0.1, pz, b.vx * 0.75 + rx * sd * (3 + Math.random() * 4), 1.5 + Math.random() * 3.5, b.vz * 0.75 + rz * sd * (3 + Math.random() * 4), 0.4 + Math.random() * 0.4, 0.25 + Math.random() * 0.4);
-      }
+    const R2 = Math.random, hm = (b.h[0] + b.h[1] + b.h[2]) / 3;
+    // rooster tail: thrown up and back from each propeller (a few mist puffs in it)
+    b.emit += (150 * smoothstep(8, 35, sp) * (b.boosting ? 1.4 : 1) + 60 * smoothstep(1.5, 4, Math.abs(b.vy))) * dt;
+    for (; b.emit >= 1; b.emit--) {
+      const ox = (R2() < 0.5 ? -0.56 : 0.56) + (R2() - 0.5) * 0.2, mist = R2() < 0.15, up = 3 + R2() * 7 * smoothstep(10, 45, sp);
+      spawn(b.x - fx * 5.25 + rx * ox, b.y - 0.25, b.z - fz * 5.25 + rz * ox,
+        b.vx * 0.72 - fx * (1 + R2() * 3) + (R2() - 0.5) * 2 * rx, up, b.vz * 0.72 - fz * (1 + R2() * 3) + (R2() - 0.5) * 2 * rz,
+        mist ? 1 + R2() * 0.7 : 0.45 + R2() * 0.6, mist ? 0.9 + R2() * 1.2 : 0.1 + R2() * 0.25, mist ? 0.1 : 0.55);
+    }
+    // spray curtains peeling off both chines where the planing hull meets the water, heavier on the outside of a turn
+    b.emitC = (b.emitC || 0) + 420 * smoothstep(10, 35, sp) * dt;
+    for (; b.emitC >= 1; b.emitC--) {
+      const sd = R2() < 0.5 + clamp(b.yawRate, -0.4, 0.4) * -1.1 ? 1 : -1, al = -1.8 + R2() * 4, out = 2.5 + R2() * 4.5;
+      spawn(b.x + fx * al + rx * sd * 1.35, hm + 0.05, b.z + fz * al + rz * sd * 1.35,
+        b.vx * 0.85 + rx * sd * out - fx * (1 + R2() * 2), 1.5 + R2() * 4, b.vz * 0.85 + rz * sd * out - fz * (1 + R2() * 2),
+        0.35 + R2() * 0.5, 0.15 + R2() * 0.4, 0.6);
     }
     // wake: a ribbon of stern positions
     const W = b.wake, last = W[0], wx = b.x - fx * 4.6, wz = b.z - fz * 4.6;
     b.odo += sp * dt;
-    if (!last || Math.hypot(wx - last.x, wz - last.z) > 1.6) W.unshift({ x: wx, z: wz, y: b.y + 0.18, rx, rz, t: S.t, v: sp, d: b.odo });
+    if (!last || Math.hypot(wx - last.x, wz - last.z) > 1.6) W.unshift({ x: wx, z: wz, y: (b.h[0] + b.h[1] + b.h[2]) / 3 + 0.08, rx, rz, t: S.t, v: sp, d: b.odo });
     while (W.length && S.t - W[W.length - 1].t > 6) W.pop();
     if (W.length > 200) W.length = 200;
   }
@@ -584,6 +717,11 @@ void main(){
       look = v3.add(pos, v3.add(B.f, v3.mul(B.u, -0.04)));
       roll = P.roll * 0.9;
       cam.pos = pos;
+    } else if (S.camMode === 3) {   // TV camera: a helicopter pacing the boat off its quarter
+      const rx = Math.cos(G.cyaw), rz = -Math.sin(G.cyaw);
+      pos = [P.x + rx * 15 - fx * 7, P.y + 7.5, P.z + rz * 15 - fz * 7];
+      cam.pos = v3.mix(cam.pos, pos, damp(6, dt));
+      look = [P.x + fx * 2.5, P.y + 0.6, P.z + fz * 2.5];
     } else {
       const dist = S.camMode ? 24 : 12.5, hgt = S.camMode ? 8.5 : 3.9;
       pos = [P.x - fx * dist, P.y + hgt, P.z - fz * dist];
@@ -607,94 +745,134 @@ void main(){
     return { pos, r, u, f, mat: basisMatrix(r, u, f), vfov: fovDeg * DEG };
   }
   function orbitCam(cx, cz, rad, h, ang, ly) { return lookCam([cx + Math.sin(ang) * rad, h, cz + Math.cos(ang) * rad], [cx, ly, cz], 0, 55); }
+  function titleCam() {   // hovering ahead of the grid, looking back at the boats under the start banner, drifting side to side
+    const g = GATES[0], s = Math.sin(S.t * 0.15), d = 46 + 6 * Math.sin(S.t * 0.11);
+    return lookCam([g.cx + g.tx * d + g.rx * 22 * s, 7.5 + 1.5 * Math.sin(S.t * 0.13), g.cz + g.tz * d + g.rz * 22 * s], [g.cx + g.tx * 10, 1.5, g.cz + g.tz * 10], 0, 50);
+  }
   function frameCam(dt) {
     const P = BOATS[0];
-    if (S.phase === 'title') { const g = GATES[0]; return orbitCam(g.cx + g.tx * 15, g.cz + g.tz * 15, 36, 15, S.t * 0.12 + 2.2, -2); }
+    if (S.phase === 'title') return titleCam();
     if (S.phase === 'done') return orbitCam(P.x, P.z, 22, P.y + 5, S.t * 0.25, P.y + 1);
     const ch = chaseCam(dt);
     if (S.phase === 'countdown' && S.cd > 0.6) {   // swing from the orbit into the chase position
-      const g = GATES[0], k = smoothstep(3.2, 0.8, S.cd), o = orbitCam(g.cx + g.tx * 15, g.cz + g.tz * 15, 36, 15, S.t * 0.12 + 2.2, -2);
-      return lookCam(v3.mix(o.pos, ch.pos, k), v3.add(v3.mix(o.pos, ch.pos, k), v3.norm(v3.mix(o.f, ch.f, k))), 0, 55 + (G.fov - 55) * k);
+      const k = smoothstep(3.2, 0.8, S.cd), o = titleCam();
+      return lookCam(v3.mix(o.pos, ch.pos, k), v3.add(v3.mix(o.pos, ch.pos, k), v3.norm(v3.mix(o.f, ch.f, k))), 0, 50 + (G.fov - 50) * k);
     }
     return ch;
   }
 
   // ---------------------------------------------------------------- drawing
   function initGL() {
-    G.pObj = progVF(VS_OBJ, FS_OBJ); G.pWake = progVF(VS_WAKE, FS_WAKE); G.pPart = progVF(VS_PART, FS_PART);
-    const L = [[0, 3], [1, 1]];
-    G.mBoat = makeVAO(boatMesh(), L); G.mPylon = makeVAO(pylonMesh(), L); G.mBeam = makeVAO(beamMesh(), L); G.mShadow = makeVAO(shadowMesh(), L);
+    const pre = G.src.slice(0, G.src.lastIndexOf('void main(){'));
+    G.pObj = progVF(VS_OBJ, pre + FS_OBJ_MAIN); G.pWake = progVF(VS_WAKE, pre + FS_WAKE_MAIN); G.pPart = progVF(VS_PART, pre + FS_PART_MAIN);
+    G.pSh = progVF(VS_SHADOW, FS_SHADOW); G.pWSh = prog(FS_WSHADOW); G.pCopy = prog(FS_COPY);
+    const L = [[0, 3], [1, 3], [2, 1]];
+    G.mBoat = makeVAO(boatMesh(), L); G.mPylon = makeVAO(pylonMesh(), L); G.mPylon0 = makeVAO(pylonMesh(1.5), L); G.mBeam = makeVAO(beamMesh(), L);
     G.mBanner = makeVAO(bannerMesh(GATES[0]), L);
     G.wakeBuf = new Float32Array(200 * 2 * 8); G.mWake = BOATS.map(() => makeVAO(G.wakeBuf, [[0, 3], [1, 4], [2, 1]], gl.DYNAMIC_DRAW));
-    G.partBuf = new Float32Array(2500 * 5); G.mPart = makeVAO(G.partBuf, [[0, 3], [1, 2]], gl.DYNAMIC_DRAW);
+    G.partBuf = new Float32Array(3000 * 5); G.mPart = makeVAO(G.partBuf, [[0, 3], [1, 2]], gl.DYNAMIC_DRAW);
     G.pmax = gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE)[1];
+    const SM = 2048;
+    G.shTex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, G.shTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.DEPTH_COMPONENT24, SM, SM, 0, gl.DEPTH_COMPONENT, gl.UNSIGNED_INT, null);
+    for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.NEAREST], [gl.TEXTURE_MAG_FILTER, gl.NEAREST], [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]]) gl.texParameteri(gl.TEXTURE_2D, k, v);
+    G.shFb = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, G.shFb);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, G.shTex, 0); gl.drawBuffers([gl.NONE]); gl.readBuffer(gl.NONE);
+    G.SM = SM;
   }
   function ensureTarget() {
     if (G.tR === R) return;
     G.tR = R;
-    if (G.rb) gl.deleteRenderbuffer(G.rb);
+    if (G.rb) { gl.deleteRenderbuffer(G.rb); gl.deleteFramebuffer(G.fb); gl.deleteTexture(G.A); gl.deleteFramebuffer(G.Af); }
     G.rb = gl.createRenderbuffer(); gl.bindRenderbuffer(gl.RENDERBUFFER, G.rb); gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, R.w, R.h);
     G.fb = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, G.fb);
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, R.acc, 0);
     gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, G.rb);
+    G.A = tex(R.w, R.h, gl.RGBA32F, gl.RGBA, gl.FLOAT, gl.NEAREST); G.Af = fbo(G.A); G.An = 0;   // multi-sample accumulation
   }
-  function drawObjects(cam) {
-    ensureTarget();
-    const VP = viewProj(cam, R.w / R.h);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, G.fb); gl.viewport(0, 0, R.w, R.h);
-    gl.clear(gl.DEPTH_BUFFER_BIT);
-    gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LEQUAL); gl.colorMask(true, true, true, false);
-    const P = G.pObj, U = P.u;
-    gl.useProgram(P.p); gl.uniformMatrix4fv(U.uVP, false, VP); bindTex(0, R.dep); gl.uniform1i(U.uDep, 0);
-    gl.uniform3fv(U.uCamP, cam.pos); gl.uniform3fv(U.uSun, sunDir); gl.uniform1f(U.uBias, 0.15); gl.uniform1f(U.uGlow, 0);
-    const draw = (m, M, c0, c1, glow = 0) => {
-      gl.uniformMatrix4fv(U.uM, false, M); if (c0) gl.uniform3fv(U.uC0, c0); if (c1) gl.uniform3fv(U.uC1, c1); gl.uniform1f(U.uGlow, glow);
-      gl.bindVertexArray(m.va); gl.drawArrays(gl.TRIANGLES, 0, m.count);
-    };
-    for (const b of BOATS) { const B = boatBasis(b); draw(G.mBoat, modelMat(B.r, B.u, B.f, [b.x, b.y, b.z]), b.crew.hull, b.crew.trim); }
-    const nextG = S.phase === 'race' || S.phase === 'countdown' ? BOATS[0].next : -1, pulse = 0.5 + 0.5 * Math.sin(S.t * 6);
-    for (const g of GATES) {
-      const st = g.k === 0, col = st ? [.75, .75, .72] : [.95, .2, .02], glow = g.k === nextG ? 0.4 + 0.8 * pulse : 0;
-      for (const bu of g.buoys) draw(G.mPylon, modelMat([1, 0, 0], [0, 1, 0], [0, 0, 1], [bu.x, bu.h[0], bu.z], st ? 1.5 : 1), col, null, glow);
-    }
+  // everything drawn with the scene's shading: the opaque list is reused by the shadow-map pass
+  function objectList() {
+    const L = [], nextG = S.phase === 'race' || S.phase === 'countdown' ? BOATS[0].next : -1, pulse = 0.5 + 0.5 * Math.sin(S.t * 6);
+    for (const b of BOATS) { const B = boatBasis(b); L.push({ m: G.mBoat, M: modelMat(B.r, B.u, B.f, [b.x, b.y, b.z]), c0: b.crew.hull, c1: b.crew.trim, num: b.crew.num, glow: 0, wl: (b.h[0] + b.h[1] + b.h[2]) / 3 }); }
+    const I = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+    for (const g of GATES) for (const bu of g.buoys) L.push({ m: g.k ? G.mPylon : G.mPylon0, M: modelMat(...I, [bu.x, bu.h[0], bu.z]), c0: g.k ? [.9, .2, .02] : [.8, .8, .78], glow: g.k === nextG ? 0.3 + 0.7 * pulse : 0, wl: bu.h[0] });
     const g0 = GATES[0];
-    draw(G.mBanner, modelMat([g0.rx, 0, g0.rz], [0, 1, 0], [g0.tx, 0, g0.tz], [g0.cx, (g0.buoys[0].h[0] + g0.buoys[1].h[0]) / 2, g0.cz]));
-    // transparent: shadows, light beams, wakes, spray
-    gl.depthMask(false); gl.enable(gl.BLEND);
-    gl.blendFuncSeparate(gl.ZERO, gl.ONE_MINUS_SRC_ALPHA, gl.ZERO, gl.ONE); gl.uniform1f(U.uBias, 1.5);
-    const sx = -sunDir[0] / sunDir[1], sz = -sunDir[2] / sunDir[1];
-    for (const b of BOATS) {
-      const hm = (b.h[0] + b.h[1] + b.h[2]) / 3, lift = Math.max(0, b.y - hm) + 0.9;
-      draw(G.mShadow, modelMat([Math.cos(b.yaw), 0, -Math.sin(b.yaw)], [0, 1, 0], [Math.sin(b.yaw), 0, Math.cos(b.yaw)], [b.x + sx * lift, hm + 0.25, b.z + sz * lift]));
-    }
-    if (nextG >= 0) {
-      gl.blendFuncSeparate(gl.ONE, gl.ONE, gl.ZERO, gl.ONE); gl.uniform1f(U.uBias, 0.5);
-      for (const bu of GATES[nextG].buoys) draw(G.mBeam, modelMat([1, 0, 0], [0, 1, 0], [0, 0, 1], [bu.x, bu.h[0] + 3, bu.z]), null, null, 0.6 + 0.4 * pulse);
-    }
-    gl.blendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_ALPHA, gl.ZERO, gl.ONE);
-    const W = G.pWake;
-    gl.useProgram(W.p); gl.uniformMatrix4fv(W.u.uVP, false, VP); gl.uniform1i(W.u.uDep, 0); gl.uniform3fv(W.u.uCamP, cam.pos); gl.uniform1f(W.u.uT, S.t);
-    BOATS.forEach((b, i) => {
-      const pts = b.wake; if (pts.length < 2) return;
-      const a = G.wakeBuf; let n = 0;
-      for (const p of pts) {
-        const age = clamp((S.t - p.t) / 6, 0, 1), w = Math.min(1.3 + (S.t - p.t) * 0.3 * p.v, 30), I = smoothstep(2, 18, p.v);
-        for (const s of [-1, 1]) { a[n++] = p.x + p.rx * w * s; a[n++] = p.y; a[n++] = p.z + p.rz * w * s; a[n++] = s; a[n++] = age; a[n++] = I; a[n++] = w; a[n++] = p.d; }
+    L.push({ m: G.mBanner, M: modelMat([g0.rx, 0, g0.rz], [0, 1, 0], [g0.tx, 0, g0.tz], [g0.cx, (g0.buoys[0].h[0] + g0.buoys[1].h[0]) / 2, g0.cz]), glow: 0 });
+    return { L, nextG, pulse };
+  }
+  function drawObjects(cam, time, jit) {
+    ensureTarget();
+    const VP = viewProj(cam, R.w / R.h, jit), P0 = BOATS[0];
+    const c = S.phase === 'title' ? [GATES[0].cx, 0, GATES[0].cz] : [P0.x + Math.sin(P0.yaw) * 25, 0, P0.z + Math.cos(P0.yaw) * 25];
+    const LVP = lightMat(c), { L, nextG, pulse } = objectList();
+    // 1. sun shadow map of the boats and pylons
+    gl.bindFramebuffer(gl.FRAMEBUFFER, G.shFb); gl.viewport(0, 0, G.SM, G.SM); gl.clear(gl.DEPTH_BUFFER_BIT);
+    gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LEQUAL);
+    gl.useProgram(G.pSh.p); gl.uniformMatrix4fv(G.pSh.u.uRLVP, false, LVP);
+    for (const o of L) { gl.uniformMatrix4fv(G.pSh.u.uRM, false, o.M); gl.bindVertexArray(o.m.va); gl.drawArrays(gl.TRIANGLES, 0, o.m.count); }
+    // 2. their shadows on the ray-marched water and rocks
+    gl.bindFramebuffer(gl.FRAMEBUFFER, G.fb); gl.viewport(0, 0, R.w, R.h); gl.clear(gl.DEPTH_BUFFER_BIT);
+    gl.disable(gl.DEPTH_TEST); gl.enable(gl.BLEND); gl.blendFuncSeparate(gl.ZERO, gl.SRC_COLOR, gl.ZERO, gl.ONE);
+    const W = G.pWSh; gl.useProgram(W.p); gl.bindVertexArray(vao);
+    bindTex(14, R.dep); gl.uniform1i(W.u.uRDep, 14); bindTex(15, G.shTex); gl.uniform1i(W.u.uRShad, 15); gl.uniformMatrix4fv(W.u.uRLVP, false, LVP);
+    gl.uniform3fv(W.u.uRCam, cam.pos); gl.uniformMatrix3fv(W.u.uRB, false, cam.mat); gl.uniform1f(W.u.uRTan, Math.tan(cam.vfov / 2));
+    gl.uniform2f(W.u.uRRes, R.w, R.h); gl.uniform2f(W.u.uRJit, jit[0], jit[1]); gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gl.disable(gl.BLEND);
+    const common = (U) => {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, G.fb); gl.viewport(0, 0, R.w, R.h);
+      gl.uniformMatrix4fv(U.uRVP, false, VP); gl.uniformMatrix4fv(U.uRLVP, false, LVP);
+      bindTex(14, R.dep); gl.uniform1i(U.uRDep, 14); bindTex(15, G.shTex); gl.uniform1i(U.uRShad, 15);
+    };
+    // 3. boats, pylons, banner (opaque), then the light beams over the next gate (additive)
+    gl.enable(gl.DEPTH_TEST); gl.colorMask(true, true, true, false);
+    renderSample(cam, time, jit, true, G.pObj, (P) => {
+      const U = P.u; common(U); gl.uniform1f(U.uRBias, 0.15);
+      const draw = (o) => {
+        gl.uniformMatrix4fv(U.uRM, false, o.M); if (o.c0) gl.uniform3fv(U.uRC0, o.c0); if (o.c1) gl.uniform3fv(U.uRC1, o.c1);
+        gl.uniform1f(U.uRNum, o.num || 0); gl.uniform1f(U.uRGlow, o.glow || 0); gl.uniform1f(U.uRWl, o.wl == null ? -99 : o.wl);
+        gl.bindVertexArray(o.m.va); gl.drawArrays(gl.TRIANGLES, 0, o.m.count);
+      };
+      L.forEach(draw);
+      if (nextG >= 0) {
+        gl.depthMask(false); gl.enable(gl.BLEND); gl.blendFuncSeparate(gl.ONE, gl.ONE, gl.ZERO, gl.ONE); gl.uniform1f(U.uRBias, 0.5);
+        for (const bu of GATES[nextG].buoys) draw({ m: G.mBeam, M: modelMat([1, 0, 0], [0, 1, 0], [0, 0, 1], [bu.x, bu.h[0] + 4.4, bu.z]), glow: 0.6 + 0.4 * pulse });
       }
-      const m = G.mWake[i]; gl.bindVertexArray(m.va); gl.bindBuffer(gl.ARRAY_BUFFER, m.b); gl.bufferSubData(gl.ARRAY_BUFFER, 0, a, 0, n);
-      gl.drawArrays(gl.TRIANGLE_STRIP, 0, n / 8);
     });
-    if (G.parts.length) {
+    // 4. wakes and 5. spray: premultiplied alpha over the water, depth-tested against the hulls
+    gl.depthMask(false); gl.enable(gl.BLEND); gl.blendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_ALPHA, gl.ZERO, gl.ONE);
+    renderSample(cam, time, jit, true, G.pWake, (P) => {
+      common(P.u);
+      BOATS.forEach((b, i) => {
+        const pts = b.wake; if (pts.length < 2) return;
+        const a = G.wakeBuf; let n = 0;
+        for (const p of pts) {
+          const age = clamp((S.t - p.t) / 6, 0, 1), w = Math.min(1.3 + (S.t - p.t) * 0.3 * p.v, 30), I = smoothstep(2, 18, p.v);
+          for (const s of [-1, 1]) { a[n++] = p.x + p.rx * w * s; a[n++] = p.y; a[n++] = p.z + p.rz * w * s; a[n++] = s; a[n++] = age; a[n++] = I; a[n++] = w; a[n++] = p.d; }
+        }
+        const m = G.mWake[i]; gl.bindVertexArray(m.va); gl.bindBuffer(gl.ARRAY_BUFFER, m.b); gl.bufferSubData(gl.ARRAY_BUFFER, 0, a, 0, n);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, n / 8);
+      });
+    });
+    if (G.parts.length) renderSample(cam, time, jit, true, G.pPart, (P) => {
+      const U = P.u; common(U);
       const a = G.partBuf; let n = 0;
-      for (const p of G.parts) { const k = p.t / p.life; a[n++] = p.x; a[n++] = p.y; a[n++] = p.z; a[n++] = p.size * (1 + k * 1.5); a[n++] = 0.4 * (1 - k) * (1 - k); }
-      const Pp = G.pPart; gl.useProgram(Pp.p); gl.uniformMatrix4fv(Pp.u.uVP, false, VP); gl.uniform1i(Pp.u.uDep, 0); gl.uniform3fv(Pp.u.uCamP, cam.pos);
-      gl.uniform1f(Pp.u.uPix, R.h / (2 * Math.tan(cam.vfov / 2))); gl.uniform1f(Pp.u.uPmax, Math.min(G.pmax, R.h * 0.08));
+      for (const p of G.parts) { const k = p.t / p.life; a[n++] = p.x; a[n++] = p.y; a[n++] = p.z; a[n++] = p.size * (1 + k * 1.6); a[n++] = p.a * (1 - k) * (1 - k); }
+      gl.uniform3fv(U.uRCam, cam.pos); gl.uniform1f(U.uRPix, R.h / (2 * Math.tan(cam.vfov / 2))); gl.uniform1f(U.uRPmax, Math.min(G.pmax, R.h * 0.1));
       gl.bindVertexArray(G.mPart.va); gl.bindBuffer(gl.ARRAY_BUFFER, G.mPart.b); gl.bufferSubData(gl.ARRAY_BUFFER, 0, a, 0, n);
       gl.drawArrays(gl.POINTS, 0, n / 5);
-    }
+    });
     gl.disable(gl.BLEND); gl.depthMask(true); gl.disable(gl.DEPTH_TEST); gl.colorMask(true, true, true, true);
     gl.bindVertexArray(vao);
   }
+  // one full sample of the frame (scene + objects) into R.acc
+  function renderOne(cam, time, jit) { clearAcc(); renderSample(cam, time, jit, true); drawObjects(cam, time, jit); }
+  function accClear() { ensureTarget(); gl.bindFramebuffer(gl.FRAMEBUFFER, G.Af); gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT); G.An = 0; }
+  function accAdd() {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, G.Af); gl.viewport(0, 0, R.w, R.h); gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+    gl.useProgram(G.pCopy.p); bindTex(0, R.acc); gl.uniform1i(G.pCopy.u.uRSrc, 0); gl.bindVertexArray(vao); gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gl.disable(gl.BLEND); G.An++;
+  }
+  function presentAcc() { const Rs = R; R = Object.assign({}, Rs, { acc: G.A, n: G.An }); present(false); R = Rs; }
 
   // ---------------------------------------------------------------- UI
   const CSS = `
@@ -723,13 +901,14 @@ void main(){
 #load .race-sub{text-transform:none;letter-spacing:.04em;opacity:.8;margin-bottom:16px}`;
   const KEYS_HTML = `<div class="keys"><span><kbd>W</kbd><kbd>↑</kbd> 油門 throttle</span><span><kbd>S</kbd><kbd>↓</kbd> 剎車 / 倒後 brake</span>
 <span><kbd>A</kbd><kbd>D</kbd><kbd>←</kbd><kbd>→</kbd> 轉向 steer</span><span><kbd>Shift</kbd><kbd>Space</kbd> 加速 boost</span>
-<span><kbd>C</kbd> 鏡頭 camera</span><span><kbd>R</kbd> 返回檢查點 reset</span><span><kbd>P</kbd><kbd>Esc</kbd> 暫停 pause</span><span><kbd>M</kbd> 靜音 mute</span></div>`;
+<span><kbd>C</kbd> 鏡頭 camera (4)</span><span><kbd>R</kbd> 返回檢查點 reset</span><span><kbd>P</kbd><kbd>Esc</kbd> 暫停 / 影相 pause, photo</span><span><kbd>M</kbd> 靜音 mute · <kbd>H</kbd> HUD</span></div>`;
   function buildUI() {
     const d = document.createElement('div'); d.id = 'race-ui';
     d.innerHTML = `<div class="tl"><div id="r-pos"></div><div id="r-lap"></div><div id="r-time"></div><div id="r-best"></div></div>
 <canvas id="r-map" width="440" height="440"></canvas><div id="r-board"></div><div id="r-arrow"></div><div id="r-dist"></div>
 <div id="r-spd"><b id="r-spdv">0</b><span>km/h</span><div id="r-boost"><i></i></div></div><div id="r-msg"></div><div id="r-warn"></div><div id="r-panel"></div>`;
     document.body.appendChild(d);
+    if (Q2('hud') === '0') d.style.display = 'none';
     const $ = (id) => document.getElementById(id);
     ui = { root: d, pos: $('r-pos'), lap: $('r-lap'), time: $('r-time'), best: $('r-best'), map: $('r-map'), board: $('r-board'), arrow: $('r-arrow'), dist: $('r-dist'),
       spd: d.querySelector('#r-spd b'), boost: d.querySelector('#r-boost i'), msg: $('r-msg'), warn: $('r-warn'), panel: $('r-panel'), cache: {} };
@@ -823,11 +1002,12 @@ void main(){
       if (S.phase === 'title') { S.phase = 'countdown'; S.cd = 3.6; showPanel(''); G.cyaw = BOATS[0].yaw; G.cam.pos = [BOATS[0].x, 5, BOATS[0].z]; }
       else if (S.phase === 'done' && S.resT != null && S.t - S.resT > 0.8) { resetRace(); S.phase = 'countdown'; S.cd = 3.6; showPanel(''); G.cyaw = BOATS[0].yaw; }
       else if (S.paused) { S.paused = false; showPanel(''); }
-    } else if (code === 'KeyC') S.camMode = (S.camMode + 1) % 3;
+    } else if (code === 'KeyC') S.camMode = (S.camMode + 1) % 4;
     else if (code === 'KeyR' && S.phase === 'race' && !S.paused) { respawn(BOATS[0]); flash('返回檢查點 RESET', 0.8); }
     else if ((code === 'KeyP' || code === 'Escape') && (S.phase === 'race' || S.phase === 'countdown')) {
-      S.paused = !S.paused; showPanel(S.paused ? `<h1>暫停 PAUSED</h1>${KEYS_HTML}<div class="go">撳 P / Enter 繼續 · resume</div>` : '');
+      S.paused = !S.paused; showPanel(S.paused ? `<h1>暫停 PAUSED</h1><h2>畫面會慢慢變清晰 · the frame refines while paused (H hides the HUD)</h2><div class="go">撳 P / Enter 繼續 · resume</div>` : '', true);
     } else if (code === 'KeyM') setMute(AUD.on);
+    else if (code === 'KeyH') ui.root.style.display = ui.root.style.display === 'none' ? '' : 'none';
     else if (code === 'KeyF') (document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen());
   }
 
@@ -836,11 +1016,35 @@ void main(){
     const pts = [], lat = G.lat;
     for (const b of BOATS) {
       const fx = Math.sin(b.yaw), fz = Math.cos(b.yaw), rx = fz, rz = -fx, x = b.x + b.vx * lat, z = b.z + b.vz * lat;
-      pts.push({ x: x + fx * 4, z: z + fz * 4, o: b, k: 0 }, { x: x - fx * 3 - rx * 1.4, z: z - fz * 3 - rz * 1.4, o: b, k: 1 }, { x: x - fx * 3 + rx * 1.4, z: z - fz * 3 + rz * 1.4, o: b, k: 2 });
+      pts.push({ x: x + fx * 4, z: z + fz * 4, o: b, k: 0, pix: 4 }, { x: x - fx * 3 - rx * 1.4, z: z - fz * 3 - rz * 1.4, o: b, k: 1, pix: 4 }, { x: x - fx * 3 + rx * 1.4, z: z - fz * 3 + rz * 1.4, o: b, k: 2, pix: 4 });
     }
     for (const g of GATES) for (const bu of g.buoys) pts.push({ x: bu.x, z: bu.z, o: bu, k: 0 });
     pts.push({ x: G.cam.pos[0], z: G.cam.pos[2], o: G.camW, k: 0 });
     return pts;
+  }
+  const oceanT = () => S.t + 3;   // the sea's clock: frozen while paused
+  function advance(dt, inp) {
+    const n = Math.max(1, Math.ceil(dt / (1 / 120)));
+    for (let i = 0; i < n; i++) step(dt / n, inp);
+    updateParts(dt); for (const b of BOATS) emitSpray(b, dt);
+  }
+  // offline render of the current moment at the repo's still / video quality: spp jittered samples spread over the shutter
+  // interval (motion blur: the race keeps running between samples), every sample with freshly probed waves
+  async function shoot(spp = 16, shutter = 0.5, fps = 30) {
+    G.hold = true;
+    resize(cv.width, cv.height); accClear();
+    const dts = shutter / fps / spp;
+    let cam;
+    for (let k = 0; k < spp; k++) {
+      cam = frameCam(dts);
+      const t = oceanT(); oceanUpdate(t); probeSync(cam, t, probePoints());
+      renderOne(cam, t, spp > 1 ? jitter(k) : [0, 0]); accAdd();
+      await gpuWait();
+      advance(dts, readInput());
+    }
+    LOOK.lens = 0; LOOK.ca = 0; LOOK.grain = 0.003;
+    presentAcc(); updateUI(cam, 0); await gpuWait();
+    return G.An;
   }
   function start() {
     T = buildTrack(RACE.keys); GATES = buildGates(T);
@@ -858,39 +1062,46 @@ void main(){
     addEventListener('blur', () => keys.clear());
     addEventListener('resize', () => { cv.width = innerWidth; cv.height = innerHeight; });
     if (Q2('autostart') === '1') onKey('Enter');
-    // debug / test hooks: fast-forward the simulation without rendering
-    window.__race = { S: () => S, boats: () => BOATS, coast: coastAt, gates: () => GATES, track: () => T, sim: (sec, dt = 1 / 60) => { for (let t = 0; t < sec; t += dt) { step(dt, readInput()); updateParts(dt); for (const b of BOATS) emitSpray(b, dt); frameCam(dt); } }, key: onKey };
+    // test / render hooks: fast-forward without rendering, let the hulls settle on the probed waves, offline frames
+    window.__race = {
+      S: () => S, boats: () => BOATS, cam: (m) => { S.camMode = m; }, coast: coastAt, gates: () => GATES, track: () => T, key: onKey, shoot,
+      sim: (sec, dt = 1 / 60) => { for (let t = 0; t < sec; t += dt) { advance(dt, readInput()); frameCam(dt); } },
+      settle: (sec, dt = 1 / 60) => { for (let t = 0; t < sec; t += dt) { const cam = frameCam(dt); oceanUpdate(oceanT()); probeSync(cam, oceanT(), probePoints()); advance(dt, readInput()); } },
+    };
     if (Q.has('nodraw')) { window.__ready = true; return; }
-    let last = performance.now(), rs = num('rs', 0.5), slow = 0, fast = 0, time = 3;
+    let last = performance.now(), rs = num('rs', 0.5), slow = 0, fast = 0;
     const loop = (now) => {
+      requestAnimationFrame(loop);
       const dt = Math.min((now - last) / 1000, 0.1); last = now;
-      if (dt > 0.05) { slow++; fast = 0; } else if (dt < 0.03) { fast++; slow = 0; }
-      if (slow > 6) { rs = Math.max(0.25, rs - 0.05); slow = 0; } if (fast > 40) { rs = Math.min(1, rs + 0.05); fast = 0; }
+      if (G.hold) return;
       const inp = readInput();
-      if (!S.paused) {
-        const n = Math.ceil(dt / (1 / 120));
-        for (let i = 0; i < n; i++) step(dt / n, inp);
-        updateParts(dt); for (const b of BOATS) emitSpray(b, dt);
-        time += dt;
-      }
+      if (!S.paused) advance(dt, inp);
       const P = BOATS[0];
-      audioEngine(Math.hypot(P.vx, P.vz), S.phase === 'race' ? (G.autopilot ? 0.8 : Math.max(inp.thr, 0)) : 0, P.boosting ? 1 : 0);
+      audioEngine(Math.hypot(P.vx, P.vz), S.phase === 'race' && !S.paused ? (G.autopilot ? 0.8 : Math.max(inp.thr, 0)) : 0, P.boosting && !S.paused ? 1 : 0);
       probePoll();
       const cam = frameCam(S.paused ? 0 : dt);
-      resize(Math.round(cv.width * rs), Math.round(cv.height * rs));
-      oceanUpdate(time);
-      probeIssue(cam, time, probePoints());
-      G.lat = 0.7 * G.lat + 0.3 * Math.min(0.25, dt * 1.5);
-      clearAcc(); renderSample(cam, time, [0, 0], true);
-      drawObjects(cam);
-      LOOK.lens = 0; LOOK.ca = 0; LOOK.grain = 0.004;
-      present(false);
+      if (S.paused) {   // photo mode: the frozen moment refines at full resolution, one jittered sample per frame
+        if (!G.still) { G.still = true; resize(cv.width, cv.height); accClear(); }
+        if (G.An < 256) { const t = oceanT(); oceanUpdate(t); renderOne(cam, t, jitter(G.An)); accAdd(); }
+        LOOK.grain = 0.003; presentAcc();
+      } else {
+        G.still = false;
+        if (dt > 0.05) { slow++; fast = 0; } else if (dt < 0.03) { fast++; slow = 0; }
+        if (slow > 6) { rs = Math.max(0.25, rs - 0.05); slow = 0; } if (fast > 40) { rs = Math.min(1, rs + 0.05); fast = 0; }
+        resize(Math.round(cv.width * rs), Math.round(cv.height * rs));
+        const t = oceanT(); oceanUpdate(t);
+        probeIssue(cam, t, probePoints());
+        G.lat = 0.7 * G.lat + 0.3 * Math.min(0.25, dt * 1.5);
+        renderOne(cam, t, [0, 0]);
+        LOOK.lens = 0; LOOK.ca = 0; LOOK.grain = 0.004;
+        present(false);
+      }
       updateUI(cam, S.paused ? 0 : dt);
       window.__frames = (window.__frames || 0) + 1;
-      requestAnimationFrame(loop);
     };
     requestAnimationFrame(loop);
   }
+
 
   if (MODE === 'race') {
     document.title = 'Na Pali Powerboat Race';

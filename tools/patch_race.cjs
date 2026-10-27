@@ -1,6 +1,8 @@
 // Race mode hooks (tools/race.js): a hit-distance render target next to the HDR accumulator, a program / draw override
 // for renderSample (the race's wave-probe pass shares its uniforms), and the mode switch in main().
 module.exports = (rep) => {
+  rep('  if (R && R.w === w && R.h === h) return;\n',
+    "  if (R && R.w === w && R.h === h) return;\n  if (R && MODE === 'race') { [R.acc, R.dep, ...R.b].forEach((t) => t && gl.deleteTexture(t)); [R.f, ...R.bf].forEach((f) => gl.deleteFramebuffer(f)); }\n");
   rep('R.f = fbo(R.acc); R.n = 0;',
     "R.dep = MODE === 'race' ? tex(w, h, gl.R32F, gl.RED, gl.FLOAT, gl.NEAREST) : null; R.f = fbo(R.acc, R.dep); R.n = 0;");
   rep('function renderSample(cam, time, jit, oceanReady) {', 'function renderSample(cam, time, jit, oceanReady, P0 = null, drawFn = null) {');
